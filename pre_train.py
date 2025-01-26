@@ -1,233 +1,218 @@
-import os
-import nibabel as nib
-import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from torch.utils.data import DataLoader, Dataset
 
-# Define MLP Encoder using PyTorch
-class MLPEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(MLPEncoder, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_size),
-            nn.ReLU()
+def load_data():
+    # Load data files
+    microbiome = pd.read_csv('/Users/thongnguyen/Downloads/New/Microbiome.csv')
+    blood_metabolites = pd.read_csv('/Users/thongnguyen/Downloads/New/Blood_Metabolites.csv')
+    inflammatory_markers = pd.read_csv('/Users/thongnguyen/Downloads/New/Sirolimus_inflammatory_markers.csv')
+    blood_data = pd.read_csv('/Users/thongnguyen/Downloads/New/Sirolimus_Blood_Data.csv')
+    other_data = pd.read_csv('/Users/thongnguyen/Downloads/New/Other.csv')
+
+    # Drop the 'APOE4' column from other_data, if it exists
+    if 'APOE4' in other_data.columns:
+        other_data = other_data.drop(columns=['APOE4'])
+
+    # Standardize and clean column names
+    for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]:
+        df.rename(columns=lambda x: x.strip(), inplace=True)
+
+    # Ensure 'Patient_ID' and 'Timepoint' columns are strings for consistent merging
+    for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]:
+        if 'Patient_ID' in df.columns:
+            df['Patient_ID'] = df['Patient_ID'].astype(str).str.strip()
+        if 'Timepoint' in df.columns:
+            df['Timepoint'] = df['Timepoint'].astype(str).str.strip()
+
+    # Retain only numeric columns
+    def filter_numeric(df):
+        return df.select_dtypes(include=['number']).copy()
+
+    microbiome_numeric = filter_numeric(microbiome)
+    blood_metabolites_numeric = filter_numeric(blood_metabolites)
+    inflammatory_markers_numeric = filter_numeric(inflammatory_markers)
+    blood_data_numeric = filter_numeric(blood_data)
+
+    # Add back 'Patient_ID' and 'Timepoint' for merging
+    microbiome_numeric[['Patient_ID', 'Timepoint']] = microbiome[['Patient_ID', 'Timepoint']]
+    blood_metabolites_numeric[['Patient_ID', 'Timepoint']] = blood_metabolites[['Patient_ID', 'Timepoint']]
+    inflammatory_markers_numeric[['Patient_ID', 'Timepoint']] = inflammatory_markers[['Patient_ID', 'Timepoint']]
+    blood_data_numeric[['Patient_ID', 'Timepoint']] = blood_data[['Patient_ID', 'Timepoint']]
+
+    # Merge datasets on Patient_ID and Timepoint
+    data = other_data.merge(microbiome_numeric, on=['Patient_ID', 'Timepoint'], how='inner')
+    data = data.merge(blood_metabolites_numeric, on=['Patient_ID', 'Timepoint'], how='inner')
+    data = data.merge(inflammatory_markers_numeric, on=['Patient_ID', 'Timepoint'], how='inner')
+    data = data.merge(blood_data_numeric, on=['Patient_ID', 'Timepoint'], how='inner')
+
+    # Handle missing values
+    data = data.fillna(0)
+
+    return data
+
+# Dataset class
+class PatientDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+        self.patient_ids = torch.tensor(data['Patient_ID'].astype('category').cat.codes.values, dtype=torch.long)
+        self.timepoints = torch.tensor(data['Timepoint'].astype('category').cat.codes.values, dtype=torch.long)
+        self.microbiome_data = data.filter(like='Microbiome_').values
+        self.biomarker_data = data.filter(like='Biomarker_').values
+        self.other_data = data.filter(like='Other_').values
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.microbiome_data[idx], dtype=torch.float32),
+            torch.tensor(self.biomarker_data[idx], dtype=torch.float32),
+            torch.tensor(self.other_data[idx], dtype=torch.float32),
+            self.patient_ids[idx],
+            self.timepoints[idx]
         )
 
-    def forward(self, x):
-        return self.model(x)
-
-# Define Linear Projection Layer using PyTorch
-class LinearProjection(nn.Module):
+# Encoders
+class MLPEncoder(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(LinearProjection, self).__init__()
-        self.linear = nn.Linear(input_dim, output_dim)
+        super(MLPEncoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.encoder:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                nn.init.constant_(m.bias, 0.01)
 
     def forward(self, x):
-        return self.linear(x)
+        x = self.encoder(x)
+        return F.normalize(x, p=2, dim=-1)  # L2 normalization
 
-# NT-Xent Contrastive Loss Function
-class NTXentLoss(nn.Module):
-    def __init__(self, temperature=0.5):
-        super(NTXentLoss, self).__init__()
-        self.temperature = temperature
+def forward_pass(microbiome_data, biomarker_data, other_data, microbiome_encoder, biomarker_encoder, other_encoder):
+    # Encode all data types
+    e_microbiome = microbiome_encoder(microbiome_data)
+    e_biomarker = biomarker_encoder(biomarker_data)
+    e_other = other_encoder(other_data)
 
-    def forward(self, z_i, z_j):
-        # Normalize the representations
-        z_i = F.normalize(z_i, dim=1)
-        z_j = F.normalize(z_j, dim=1)
+    # Normalize all embeddings
+    e_microbiome = F.normalize(e_microbiome, p=2, dim=-1)
+    e_biomarker = F.normalize(e_biomarker, p=2, dim=-1)
+    e_other = F.normalize(e_other, p=2, dim=-1)
 
-        # Concatenate positive pairs
-        z = torch.cat([z_i, z_j], dim=0)
+    return e_microbiome, e_biomarker, e_other
 
-        # Compute similarity matrix
-        sim = torch.mm(z, z.T) / self.temperature
-        sim_exp = torch.exp(sim)
-
-        # Debug: Print similarity matrix
-        print("Similarity matrix:", sim.cpu().detach().numpy())
-
-        # Create mask to exclude self-similarities
-        batch_size = z_i.size(0)
-        mask = torch.eye(2 * batch_size, dtype=torch.bool).to(z.device)
-
-        # Compute NT-Xent Loss
-        positive_sim = torch.cat([torch.diag(sim, batch_size), torch.diag(sim, -batch_size)])
-        positive_sim = torch.exp(positive_sim / self.temperature)
-
-        # Debug: Print positive similarities
-        print("Positive similarities:", positive_sim.cpu().detach().numpy())
-
-        denominator = sim_exp.sum(dim=1) - sim_exp.diagonal()
-
-        # Debug: Print denominator values
-        print("Denominator values:", denominator.cpu().detach().numpy())
-
-        loss = -torch.log(positive_sim / denominator)
-
-        # Debug: Print individual loss values
-        print("Individual loss values:", loss.cpu().detach().numpy())
-
-        return loss.mean()
-
-# Function to load and preprocess .nii MRI images
-def preprocess_mri_images(root_dir):
+def patient_contrastive_loss(e_microbiome, e_biomarker, e_other, patient_ids, tau=0.1):
     """
-    Load and preprocess .nii MRI images organized in folders by patient ID.
-    Args:
-        root_dir (str): Path to the root directory containing patient folders.
+    Computes the patient contrastive loss with multiple embeddings.
+
+    Parameters:
+    - e_microbiome, e_biomarker, e_other: Encoded representations of different data modalities.
+    - patient_ids: Tensor of patient IDs.
+    - tau: Temperature scaling factor.
+
     Returns:
-        dict: A dictionary where keys are patient IDs and values are preprocessed image tensors.
+    - Mean contrastive loss for the batch.
     """
-    patient_data = {}
-    for patient_folder in os.listdir(root_dir):
-        patient_path = os.path.join(root_dir, patient_folder)
-        if os.path.isdir(patient_path):  # Ensure it's a directory
-            images = {}
-            for file_name in os.listdir(patient_path):
-                file_path = os.path.join(patient_path, file_name)
-                if file_name.lower().endswith('.nii'):
-                    # Identify timepoint from file name
-                    if "base" in file_name.lower():
-                        timepoint = "Base"
-                    elif "post" in file_name.lower():
-                        timepoint = "Post"
-                    elif "washout" in file_name.lower():
-                        timepoint = "Washout"
-                    else:
-                        continue  # Skip files without a known timepoint
+    # Concatenate all embeddings into a single matrix
+    embeddings = torch.stack([e_microbiome, e_biomarker, e_other], dim=1)  # Shape: (batch_size, 3, embed_dim)
 
-                    # Load and preprocess the .nii file
-                    nii_image = nib.load(file_path)
-                    image_data = nii_image.get_fdata()  # Extract voxel data
-                    image_data = np.nan_to_num(image_data)  # Replace NaNs with zeros
-                    image_data = (image_data - image_data.mean()) / image_data.std()  # Normalize voxel values
-                    image_data = torch.tensor(image_data, dtype=torch.float32)  # Convert to tensor
-                    image_data = image_data.unsqueeze(0)  # Add channel dimension (e.g., for CNNs)
+    # Compute pairwise similarities
+    sim_matrix = torch.einsum('bmd,bnd->bmn', embeddings, embeddings)  # Shape: (batch_size, 3, 3)
+    sim_matrix = sim_matrix / tau  # Apply temperature scaling
 
-                    images[timepoint] = image_data
+    # Create a mask to identify positive pairs (same patient)
+    patient_mask = patient_ids[:, None] == patient_ids[None, :]  # Shape: (batch_size, batch_size)
 
-            # Store the processed images for the patient
-            if len(images) == 3:  # Ensure all three timepoints are present
-                patient_data[patient_folder] = images
-    return patient_data
+    # Expand the patient_mask to align with sim_matrix
+    patient_mask = patient_mask.unsqueeze(1).unsqueeze(2).expand(-1, 3, 3, -1)  # Shape: (batch_size, 3, 3, batch_size)
 
-# Function to preprocess other data files
-def preprocess_data_custom(file_path, file_name):
-    df = pd.read_csv(file_path)
-    timepoints = ["Base", "Post", "Washout"]
-    if "Timepoint" in df.columns:
-        df = df[df["Timepoint"].isin(timepoints)]
-    else:
-        raise ValueError(f"The file '{file_name}' does not contain a 'Timepoint' column.")
-    drop_columns = ["date", "ID", "sample", "Subject ID Full", "Subject ID", "Unnamed: 0"]
-    df = df.drop(columns=[col for col in drop_columns if col in df.columns], errors="ignore")
-    for col in df.select_dtypes(include=["object"]).columns:
-        if col not in ["Timepoint", "Patient_ID"]:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-    if "Patient_ID" in df.columns and "Timepoint" in df.columns:
-        df_pivot = df.pivot(index="Patient_ID", columns="Timepoint")
-        df_pivot.columns = ["_".join(col).strip() for col in df_pivot.columns.values]
-        df_pivot = df_pivot.dropna()
-    else:
-        raise ValueError(f"The file '{file_name}' is missing required columns 'Patient_ID' or 'Timepoint'.")
-    scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(df_pivot)
-    return torch.tensor(data_scaled, dtype=torch.float32)
+    # Expand sim_matrix for broadcasting
+    sim_matrix = sim_matrix.unsqueeze(-1)  # Shape: (batch_size, 3, 3, 1)
 
-# Main script
-if __name__ == "__main__":
-    # Set root directory for MRI images
-    root_directory = "/Users/thongnguyen/Downloads/CBF_imaging"  # Update this to your actual root directory containing patient folders
+    # Compute positive and total pairs
+    positive_pairs = sim_matrix * patient_mask.float()  # Shape: (batch_size, 3, 3, batch_size)
+    total_pairs = sim_matrix  # Shape: (batch_size, 3, 3, batch_size)
 
-    # Load and preprocess images
-    patient_images = preprocess_mri_images(root_directory)
+    # Sum over relevant dimensions
+    positive_sum = torch.sum(positive_pairs, dim=(-1, 2))  # Shape: (batch_size, 3)
+    total_sum = torch.sum(total_pairs, dim=(-1, 2))  # Shape: (batch_size, 3)
 
-    # Process other data files
-    file_paths = {
-        "Sirolimus_Blood_Data": "/Users/thongnguyen/Downloads/New/Sirolimus_Blood_Data.csv",
-        "Microbiome": "/Users/thongnguyen/Downloads/New/Microbiome.csv",
-        "Blood_Metabolites": "/Users/thongnguyen/Downloads/New/Blood_Metabolites.csv",
-        "Brain_CBF_Imaging": "/Users/thongnguyen/Downloads/New/Brain_CBF_Imaging.csv",
-        "Other": "/Users/thongnguyen/Downloads/New/Other.csv",
-        "Sirolimus_Inflammatory_Markers": "/Users/thongnguyen/Downloads/New/Sirolimus_Inflammatory_Markers.csv",
-    }
+    # Compute contrastive loss
+    loss = -torch.log(torch.sum(positive_sum) / torch.sum(sim_matrix))
+    return torch.mean(loss)
 
-    models = {}
-    for name, path in file_paths.items():
-        try:
-            data_tensor = preprocess_data_custom(path, name)
-            input_dim = data_tensor.shape[1]
-            hidden_dim = 64
-            encoded_dim = 32
-            output_dim = 10
 
-            mlp_model = MLPEncoder(input_dim, hidden_dim, encoded_dim)
-            projection_layer = LinearProjection(encoded_dim, output_dim)
-            contrastive_loss = NTXentLoss(temperature=0.5)
+def train_model(data, patience=10, batch_size=3, output_dim=32):
+    """
+    Trains the model with early stopping.
+    
+    Parameters:
+    - data: Merged dataset.
+    - patience: Number of epochs to wait for improvement before stopping.
+    - batch_size: Batch size for training.
+    - output_dim: Output dimension of the encoders.
+    """
+    dataset = PatientDataset(data)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-            # Generate augmented views
-            aug_view1 = data_tensor + torch.randn_like(data_tensor) * 0.1
-            aug_view2 = data_tensor + torch.randn_like(data_tensor) * 0.1
+    microbiome_encoder = MLPEncoder(input_dim=data.filter(like='Microbiome_').shape[1], output_dim=output_dim)
+    biomarker_encoder = MLPEncoder(input_dim=data.filter(like='Biomarker_').shape[1], output_dim=output_dim)
+    other_encoder = MLPEncoder(input_dim=data.filter(like='Other_').shape[1], output_dim=output_dim)
 
-            # Pass through encoder and projection
-            encoded1 = mlp_model(aug_view1)
-            encoded2 = mlp_model(aug_view2)
-            projected1 = projection_layer(encoded1)
-            projected2 = projection_layer(encoded2)
+    optimizer = torch.optim.Adam(
+        list(microbiome_encoder.parameters()) +
+        list(biomarker_encoder.parameters()) +
+        list(other_encoder.parameters()), lr=1e-4
+    )
 
-            # Compute contrastive loss
-            loss = contrastive_loss(projected1, projected2)
-            print(f"Contrastive Loss for {name}: {loss.item()}")
+    best_loss = float('inf')
+    epochs_no_improve = 0
 
-            models[name] = {"mlp": mlp_model, "projection": projection_layer}
-        except Exception as e:
-            print(f"Error processing {name}: {e}")
+    for epoch in range(1, 1001):  # Arbitrary high number; will stop early if needed
+        epoch_loss = 0
+        for batch in dataloader:
+            microbiome_data, biomarker_data, other_data, patient_ids, timepoints = batch
 
-    # Process MRI images through MLP and projection in batches
-    batch_size = 16
-    patient_ids = list(patient_images.keys())
+            # Forward pass
+            e_microbiome, e_biomarker, e_other = forward_pass(
+                microbiome_data, biomarker_data, other_data,
+                microbiome_encoder, biomarker_encoder, other_encoder
+            )
 
-    for i in range(0, len(patient_ids), batch_size):
-        batch_patients = patient_ids[i:i + batch_size]
-        batch_data = []
+            # Compute loss
+            loss = patient_contrastive_loss(e_microbiome, e_biomarker, e_other, patient_ids)
+            epoch_loss += loss.item()
 
-        for patient_id in batch_patients:
-            images = patient_images[patient_id]
-            combined_image = torch.cat([images["Base"], images["Post"], images["Washout"]], dim=0)
-            flattened_image = combined_image.view(1, -1)  # Flatten for MLP input
-            batch_data.append(flattened_image)
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        batch_data = torch.cat(batch_data, dim=0)  # Create a batch
+        # Compute average epoch loss
+        epoch_loss /= len(dataloader)
+        print(f"Epoch {epoch}, Loss: {epoch_loss:.4f}")
 
-        try:
-            input_dim = batch_data.size(1)
-            hidden_dim = 64
-            encoded_dim = 32
-            output_dim = 10
+        # Early stopping logic
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            epochs_no_improve = 0  # Reset counter if improvement
+        else:
+            epochs_no_improve += 1
 
-            mlp_model = MLPEncoder(input_dim, hidden_dim, encoded_dim)
-            projection_layer = LinearProjection(encoded_dim, output_dim)
-            contrastive_loss = NTXentLoss(temperature=0.5)
+        if epochs_no_improve >= patience:
+            print(f"Stopping early at epoch {epoch}. Best loss: {best_loss:.4f}")
+            break
 
-            # Generate augmented views
-            aug_view1 = batch_data + torch.randn_like(batch_data) * 0.1
-            aug_view2 = batch_data + torch.randn_like(batch_data) * 0.1
 
-            # Pass through encoder and projection
-            encoded1 = mlp_model(aug_view1)
-            encoded2 = mlp_model(aug_view2)
-            projected1 = projection_layer(encoded1)
-            projected2 = projection_layer(encoded2)
+# Load data and train the model
+data = load_data()
+train_model(data, patience=5, batch_size=16, output_dim=32)
 
-            # Compute contrastive loss
-            loss = contrastive_loss(projected1, projected2)
-            print(f"Batch {i // batch_size + 1}: Contrastive Loss = {loss.item()}")
-
-        except Exception as e:
-            print(f"Error processing batch {i // batch_size + 1}: {e}")
