@@ -20,9 +20,8 @@ import matplotlib.pyplot as plt  # For the chart
 # ------------------------------
 def load_data():
     """
-    Load and merge all CSV files. Rename numeric columns to have 
-    'Microbiome_', 'Biomarker_', 'Other_' prefixes, ensuring 
-    we can pick them up easily later in the dataset.
+    Load and merge all CSV files, including Brain_CBF_Imaging.csv.
+    Rename numeric columns to have 'Microbiome_', 'Biomarker_', 'Other_', 'CBF_' prefixes.
     """
     def load_file(file_path):
         try:
@@ -39,10 +38,11 @@ def load_data():
     inflammatory_markers = load_file('/Users/thongnguyen/Downloads/New/Sirolimus_inflammatory_markers.csv')
     blood_data           = load_file('/Users/thongnguyen/Downloads/New/Sirolimus_Blood_Data.csv')
     other_data           = load_file('/Users/thongnguyen/Downloads/New/Other.csv')
+    brain_cbf_imaging    = load_file('/Users/thongnguyen/Downloads/New/Brain_CBF_Imaging.csv')  # <--- NEW FILE
 
     for name, df in zip(
-        ["Microbiome", "Blood Metabolites", "Inflammatory Markers", "Blood Data", "Other"],
-        [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]
+        ["Microbiome", "Blood Metabolites", "Inflammatory Markers", "Blood Data", "Other", "Brain CBF Imaging"],
+        [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data, brain_cbf_imaging]
     ):
         if df.empty:
             print(f"⚠️ Warning: {name} data is empty or missing.")
@@ -53,8 +53,8 @@ def load_data():
     if 'APOE4' in other_data.columns:
         other_data.drop(columns=['APOE4'], inplace=True)
 
-    # Ensure 'Patient_ID' & 'Timepoint' are string
-    for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]:
+    # Convert 'Patient_ID' & 'Timepoint' to string format
+    for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data, brain_cbf_imaging]:
         if 'Patient_ID' in df.columns:
             df['Patient_ID'] = df['Patient_ID'].astype(str).str.strip()
         if 'Timepoint' in df.columns:
@@ -63,14 +63,15 @@ def load_data():
     def filter_numeric(df):
         return df.select_dtypes(include=['number']).copy()
 
-    # Numeric subsets
+    # Extract numeric features
     microbiome_numeric           = filter_numeric(microbiome)
     blood_metabolites_numeric    = filter_numeric(blood_metabolites)
     inflammatory_markers_numeric = filter_numeric(inflammatory_markers)
     blood_data_numeric           = filter_numeric(blood_data)
     other_data_numeric           = filter_numeric(other_data)
+    brain_cbf_numeric            = filter_numeric(brain_cbf_imaging)
 
-    # Helper to restore ID/time columns
+    # Helper to restore 'Patient_ID' and 'Timepoint'
     def add_id_time(df, original_df):
         if 'Patient_ID' in original_df.columns and 'Timepoint' in original_df.columns:
             df['Patient_ID'] = original_df['Patient_ID']
@@ -82,29 +83,30 @@ def load_data():
     inflammatory_markers_numeric = add_id_time(inflammatory_markers_numeric, inflammatory_markers)
     blood_data_numeric           = add_id_time(blood_data_numeric,           blood_data)
     other_data_numeric           = add_id_time(other_data_numeric,           other_data)
+    brain_cbf_numeric            = add_id_time(brain_cbf_numeric,            brain_cbf_imaging)
 
-    # Helper to prefix columns for easy selection
-    def add_prefix_except(df, prefix, skip=('Patient_ID','Timepoint')):
-        new_names = {}
-        for col in df.columns:
-            if col not in skip:
-                new_names[col] = f"{prefix}{col}"
-        return df.rename(columns=new_names)
+    # Prefix column names
+    def add_prefix_except(df, prefix, skip=('Patient_ID', 'Timepoint')):
+        return df.rename(columns={
+            col: f"{prefix}{col}" 
+            for col in df.columns if col not in skip
+        })
 
-    # Add prefixes
     microbiome_numeric           = add_prefix_except(microbiome_numeric,           "Microbiome_")
     blood_metabolites_numeric    = add_prefix_except(blood_metabolites_numeric,    "Biomarker_")
     inflammatory_markers_numeric = add_prefix_except(inflammatory_markers_numeric, "Biomarker_")
     blood_data_numeric           = add_prefix_except(blood_data_numeric,           "Biomarker_")
     other_data_numeric           = add_prefix_except(other_data_numeric,           "Other_")
+    brain_cbf_numeric            = add_prefix_except(brain_cbf_numeric,            "CBF_")
 
-    # Merge all on (Patient_ID, Timepoint)
+    # Merge all on 'Patient_ID' and 'Timepoint'
     data = other_data_numeric
     for numeric_df in [
         microbiome_numeric,
         blood_metabolites_numeric,
         inflammatory_markers_numeric,
-        blood_data_numeric
+        blood_data_numeric,
+        brain_cbf_numeric  # <--- Include Brain CBF Imaging data
     ]:
         data = data.merge(numeric_df, on=['Patient_ID', 'Timepoint'], how='inner')
 
@@ -133,6 +135,7 @@ def load_mri_data(root_dir):
                     mri_image = nib.load(timepoint_path).get_fdata()
                     # If 4D, reduce to 3D
                     if len(mri_image.shape) == 4:
+                        print(f"Reducing 4D MRI for {patient_id} at {timepoint_name} to 3D...")
                         mri_image = np.mean(mri_image, axis=-1)
 
                     mri_tensor = torch.tensor(mri_image, dtype=torch.float32).unsqueeze(0)
@@ -144,7 +147,9 @@ def load_mri_data(root_dir):
 # 3) PatientDataset Definition
 # -----------------------------
 class PatientDataset(Dataset):
-    """Returns (mri, microbiome_data, biomarker_data, other_data, patient_id_code)."""
+    """
+    Returns (mri, microbiome_data, biomarker_data, other_data, cbf_data, patient_id_code).
+    """
     def __init__(self, data, mri_dict):
         super().__init__()
         self.data = data
@@ -159,6 +164,7 @@ class PatientDataset(Dataset):
         self.microbiome_data = data.filter(like='Microbiome_').values
         self.biomarker_data  = data.filter(like='Biomarker_').values
         self.other_data      = data.filter(like='Other_').values
+        self.cbf_data        = data.filter(like='CBF_').values  # <--- new
 
     def __len__(self):
         return len(self.data)
@@ -177,9 +183,10 @@ class PatientDataset(Dataset):
         micro_tensor = torch.tensor(self.microbiome_data[idx], dtype=torch.float32)
         biom_tensor  = torch.tensor(self.biomarker_data[idx],  dtype=torch.float32)
         other_tensor = torch.tensor(self.other_data[idx],      dtype=torch.float32)
+        cbf_tensor   = torch.tensor(self.cbf_data[idx],        dtype=torch.float32)
         pid_code     = self.patient_ids[idx]
 
-        return mri_tensor, micro_tensor, biom_tensor, other_tensor, pid_code
+        return mri_tensor, micro_tensor, biom_tensor, other_tensor, cbf_tensor, pid_code
 
 
 # -----------------------------
@@ -224,7 +231,6 @@ class CLIPEncoder(nn.Module):
         self.fc = nn.Linear(self.flat_dim, embed_dim)
 
     def forward(self, x):
-        # x => (batch,1,D,H,W)
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
@@ -232,7 +238,7 @@ class CLIPEncoder(nn.Module):
 
 
 class MLPEncoder(nn.Module):
-    """An MLP to encode numeric data (microbiome, biomarker, other) into same embed_dim."""
+    """An MLP to encode numeric data (microbiome, biomarker, other, CBF) into same embed_dim."""
     def __init__(self, input_dim, embed_dim=32):
         super(MLPEncoder, self).__init__()
         self.encoder = nn.Sequential(
@@ -246,33 +252,32 @@ class MLPEncoder(nn.Module):
         return F.normalize(z, p=2, dim=-1)
 
 
-def patient_contrastive_loss(e_mri, e_microbiome, e_biomarker, e_other, patient_ids, tau=0.1):
+def patient_contrastive_loss(
+    e_mri, e_microbiome, e_biomarker, e_other, e_cbf, patient_ids, tau=0.1
+):
     """
     Computes a multi-modal contrastive (CLIP-like) loss over a single batch:
-      - Flatten (batch_size*4, embed_dim) 
+      - Flatten (batch_size*5, embed_dim) 
       - Cross-sample similarity
       - InfoNCE variant with multiple positives (same patient)
     """
     B, D = e_mri.shape  # batch_size, embed_dim
 
-    # Stack embeddings: shape => (B*4, embed_dim)
-    embeddings = torch.cat([e_mri, e_microbiome, e_biomarker, e_other], dim=0)
+    # Stack embeddings: shape => (B*5, embed_dim)
+    embeddings = torch.cat([e_mri, e_microbiome, e_biomarker, e_other, e_cbf], dim=0)
 
-    # Pairwise similarity => (B*4, B*4)
+    # Pairwise similarity => (B*5, B*5)
     sim_matrix = torch.matmul(embeddings, embeddings.t()) / tau
 
     # Expand patient_ids for each modality
-    repeated_ids = patient_ids.repeat(4)  # shape => (B*4,)
+    repeated_ids = patient_ids.repeat(5)  # shape => (B*5,)
 
     # Mask out diagonal
-    diag_mask = torch.eye(B*4, dtype=torch.bool, device=sim_matrix.device)
+    diag_mask = torch.eye(B*5, dtype=torch.bool, device=sim_matrix.device)
     positive_mask = (repeated_ids.unsqueeze(0) == repeated_ids.unsqueeze(1)) & (~diag_mask)
 
     sim_exp = torch.exp(sim_matrix)
-    # Sum over all but self
     all_sum = sim_exp.sum(dim=1)
-
-    # Sum over positives
     pos_sum = (sim_exp * positive_mask).sum(dim=1)
 
     eps = 1e-8
@@ -285,35 +290,39 @@ def patient_contrastive_loss(e_mri, e_microbiome, e_biomarker, e_other, patient_
 # -----------------------------
 class MultiModalEmbeddingModule(pl.LightningModule):
     """
-    Encodes each modality (MRI, Microbiome, Biomarker, Other) to embed_dim,
+    Encodes each modality (MRI, Microbiome, Biomarker, Other, CBF) to embed_dim,
     then performs a contrastive loss in training_step.
     """
-    def __init__(self, micro_dim, biom_dim, other_dim, embed_dim=32, lr=1e-4):
+    def __init__(self, micro_dim, biom_dim, other_dim, cbf_dim, embed_dim=32, lr=1e-4):
         super().__init__()
         self.save_hyperparameters()
 
         # Encoders
-        self.mri_encoder = CLIPEncoder(input_shape=(128,128,128), embed_dim=embed_dim)
-        self.microbe_encoder = MLPEncoder(micro_dim, embed_dim)
+        self.mri_encoder       = CLIPEncoder(input_shape=(128,128,128), embed_dim=embed_dim)
+        self.microbe_encoder   = MLPEncoder(micro_dim, embed_dim)
         self.biomarker_encoder = MLPEncoder(biom_dim, embed_dim)
-        self.other_encoder = MLPEncoder(other_dim, embed_dim)
+        self.other_encoder     = MLPEncoder(other_dim, embed_dim)
+        self.cbf_encoder       = MLPEncoder(cbf_dim, embed_dim)
 
         self.lr = lr
 
-    def forward(self, mri, micro, biom, other):
+    def forward(self, mri, micro, biom, other, cbf):
         e_mri        = self.mri_encoder(mri)
         e_microbe    = self.microbe_encoder(micro)
         e_biomarker  = self.biomarker_encoder(biom)
         e_other      = self.other_encoder(other)
-        return e_mri, e_microbe, e_biomarker, e_other
+        e_cbf        = self.cbf_encoder(cbf)
+        return e_mri, e_microbe, e_biomarker, e_other, e_cbf
 
     def training_step(self, batch, batch_idx):
-        mri, micro, biom, other, pids = batch
-        e_mri, e_micro, e_biom, e_oth = self(mri, micro, biom, other)
+        # batch => (mri, micro, biom, other, cbf, patient_ids)
+        mri, micro, biom, other, cbf, pids = batch
+        e_mri, e_micro, e_biom, e_oth, e_cbf = self(mri, micro, biom, other, cbf)
 
-        loss = patient_contrastive_loss(e_mri, e_micro, e_biom, e_oth, pids, tau=0.1)
+        loss = patient_contrastive_loss(
+            e_mri, e_micro, e_biom, e_oth, e_cbf, pids, tau=0.1
+        )
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
-
         return loss
 
     def configure_optimizers(self):
@@ -332,8 +341,6 @@ class ChartLoggerCallback(Callback):
         self.epoch_losses = []
 
     def on_train_epoch_end(self, trainer, pl_module):
-        # 'train_loss' is logged as a metric in training_step
-        # So we can get it from trainer.callback_metrics
         loss = trainer.callback_metrics.get("train_loss")
         if loss is not None:
             self.epoch_losses.append(loss.item())
@@ -349,17 +356,16 @@ class ChartLoggerCallback(Callback):
         plt.legend()
         plt.grid(True)
 
-        # Save figure as PNG (or show if you like)
-        plt.savefig("training_loss_plot.png")
+        plt.savefig("training_loss_plot1.png")
         plt.close()
-        print("Saved training loss plot to training_loss_plot.png")
+        print("Saved training loss plot to training_loss_plot1.png")
 
 
 # -----------------------------
 # 8) Main Script
 # -----------------------------
 def main():
-    # 1) Load structured CSV data
+    # 1) Load structured CSV data (including new Brain_CBF_Imaging.csv)
     data = load_data()
 
     # 2) Load MRI data
@@ -370,26 +376,30 @@ def main():
     micro_cols = data.filter(like='Microbiome_').columns
     biom_cols  = data.filter(like='Biomarker_').columns
     other_cols = data.filter(like='Other_').columns
+    cbf_cols   = data.filter(like='CBF_').columns
 
     micro_dim = len(micro_cols)
     biom_dim  = len(biom_cols)
     other_dim = len(other_cols)
+    cbf_dim   = len(cbf_cols)
 
-    print(f"Microbiome feature dim = {micro_dim}")
-    print(f"Biomarker feature dim  = {biom_dim}")
-    print(f"Other feature dim      = {other_dim}")
+    print(f"📊 Microbiome feature dim = {micro_dim}")
+    print(f"📊 Biomarker feature dim  = {biom_dim}")
+    print(f"📊 Other feature dim      = {other_dim}")
+    print(f"📊 CBF Imaging feature dim = {cbf_dim}")
 
     # 4) Build DataModule
     batch_size = 3
     dm = AlzheimerDataModule(data, mri_dict, batch_size=batch_size)
     dm.setup()
 
-    # 5) Build Model
+    # 5) Build Model (with 5 modalities: MRI, Microbiome, Biomarker, Other, CBF)
     embed_dim = 32
     model = MultiModalEmbeddingModule(
-        micro_dim=micro_dim, 
+        micro_dim=micro_dim,
         biom_dim=biom_dim,
         other_dim=other_dim,
+        cbf_dim=cbf_dim,
         embed_dim=embed_dim,
         lr=1e-4
     )
@@ -398,9 +408,9 @@ def main():
     tb_logger = TensorBoardLogger("lightning_logs", name="alzheimer_multimodal")
     chart_logger = ChartLoggerCallback()
     early_stopping = EarlyStopping(
-        monitor="train_loss",   # We don't have a val_loss, so use train_loss
-        patience=3,            # Stop if train_loss doesn't improve for 3 epochs
-        mode="min"             # We want to minimize the loss
+        monitor="train_loss",
+        patience=3,
+        mode="min"
     )
 
     # 7) Trainer
@@ -408,10 +418,10 @@ def main():
         max_epochs=20,
         logger=tb_logger,
         callbacks=[chart_logger, early_stopping],
-        # accelerator="gpu", devices=1,  # If you have a GPU
+        # accelerator="gpu", devices=1,  # Uncomment if you have a GPU
     )
 
-    # 8) Fit
+    # 8) Fit Model
     trainer.fit(model, dm)
 
 
