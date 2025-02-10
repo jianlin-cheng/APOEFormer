@@ -12,9 +12,9 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
-# ==============================
-# 🚀 LOAD STRUCTURED DATA WITH PREFIXES
-# ==============================
+#############################################
+# DATA LOADING FUNCTIONS
+#############################################
 def load_data():
     def load_file(file_path):
         try:
@@ -24,7 +24,7 @@ def load_data():
         except FileNotFoundError:
             print(f"File not found: {file_path}")
             return pd.DataFrame()
-
+    
     # Load CSV files
     microbiome = load_file('/Users/thongnguyen/Downloads/New/Microbiome.csv')
     blood_metabolites = load_file('/Users/thongnguyen/Downloads/New/Blood_Metabolites.csv')
@@ -41,20 +41,20 @@ def load_data():
         else:
             print(f"{name} data loaded with shape: {df.shape}")
 
-    # Drop problematic columns if necessary
+    # Drop a problematic column if present
     if 'APOE4' in other_data.columns:
         other_data.drop(columns=['APOE4'], inplace=True)
-
+    
     # Convert IDs and Timepoints to strings
     for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]:
         if 'Patient_ID' in df.columns:
             df['Patient_ID'] = df['Patient_ID'].astype(str).str.strip()
         if 'Timepoint' in df.columns:
             df['Timepoint'] = df['Timepoint'].astype(str).str.strip()
-
+    
     def filter_numeric(df):
         return df.select_dtypes(include=['number']).copy()
-
+    
     def add_prefix(df, prefix):
         df = df.copy()
         cols = [col for col in df.columns if col not in ['Patient_ID', 'Timepoint']]
@@ -66,30 +66,26 @@ def load_data():
     blood_metabolites_numeric = add_prefix(filter_numeric(blood_metabolites), "Biomarker")
     inflammatory_markers_numeric = add_prefix(filter_numeric(inflammatory_markers), "Inflammatory")
     blood_data_numeric = add_prefix(filter_numeric(blood_data), "Blood")
-    # For Other data, select numeric columns and then add Patient_ID and Timepoint back.
+    # For Other, select numeric columns then add back Patient_ID and Timepoint
     other_numeric = add_prefix(other_data.select_dtypes(include=[np.number]), "Other")
     other_numeric[['Patient_ID', 'Timepoint']] = other_data[['Patient_ID', 'Timepoint']]
-
-    # Add Patient_ID and Timepoint back to the other numeric dataframes
+    
+    # Add Patient_ID and Timepoint back for the other dataframes
     for numeric_df, original_df in zip(
         [microbiome_numeric, blood_metabolites_numeric, inflammatory_markers_numeric, blood_data_numeric],
         [microbiome, blood_metabolites, inflammatory_markers, blood_data]
     ):
         numeric_df[['Patient_ID', 'Timepoint']] = original_df[['Patient_ID', 'Timepoint']]
-
+    
     # Merge into other_numeric
     data = other_numeric.copy()
     for numeric_df in [microbiome_numeric, blood_metabolites_numeric, inflammatory_markers_numeric, blood_data_numeric]:
         data = data.merge(numeric_df, on=['Patient_ID', 'Timepoint'], how='inner')
-
+    
     data.fillna(0, inplace=True)
     print(f"Final merged data shape: {data.shape}")
     return data
 
-
-# ==============================
-# 🔥 LOAD MRI DATA (unchanged)
-# ==============================
 def load_mri_data(root_dir):
     mri_dict = {}
     for patient_id in os.listdir(root_dir):
@@ -100,126 +96,137 @@ def load_mri_data(root_dir):
                     timepoint_name = timepoint_file.split('.')[0]
                     timepoint_path = os.path.join(patient_path, timepoint_file)
                     mri_image = nib.load(timepoint_path).get_fdata()
-                    # If 4D, average over the last dimension
                     if len(mri_image.shape) == 4:
                         mri_image = np.mean(mri_image, axis=-1)
-                    # Ensure shape is (1, D, H, W)
                     mri_tensor = torch.tensor(mri_image, dtype=torch.float32).unsqueeze(0)
                     mri_dict[(patient_id, timepoint_name)] = mri_tensor
     return mri_dict
 
-# ==============================
-# 📌 DATASET WITH POSITIVE & NEGATIVE PAIRS
-# ==============================
-class PatientContrastiveDataset(Dataset):
+#############################################
+# DATASET CLASS WITH MULTIPLE NEGATIVE SAMPLES
+#############################################
+class PatientContrastiveDatasetSeparate(Dataset):
     """
-    For each sample, return a tuple:
-      (positive_sample, negative_sample)
-      
-    - Positive sample: All modalities (MRI, Microbiome, Biomarkers, Other) from the same patient.
-    - Negative sample: Uses the same MRI (rotated by 90° along the H and W dims)
-      paired with tabular data from a different patient.
+    For each original observation (a row in the merged data), this dataset generates
+    (num_negatives + 1) samples:
+      - 1 positive sample (label = 1): all modalities come from that observation.
+      - num_negatives negative samples (label = 0): the MRI (rotated) from that observation
+        is paired with tabular data that is a mixture (averaged from num_to_mix different rows)
+        from different observations.
+    
+    Total dataset size = (# original rows) * (1 + num_negatives)
     """
-    def __init__(self, data, mri_dict):
+    def __init__(self, data, mri_dict, num_negatives=300, num_to_mix=3):
         self.data = data.reset_index(drop=True)
         self.mri_dict = mri_dict
-
-        # Convert Patient_ID and Timepoint into numeric codes (if needed for loss)
-        self.patient_ids = torch.tensor(
-            data['Patient_ID'].astype('category').cat.codes.values, 
-            dtype=torch.long
-        )
-        self.timepoints = torch.tensor(
-            data['Timepoint'].astype('category').cat.codes.values,
-            dtype=torch.long
-        )
-
-        # Convert filtered columns to float32 so they can be turned into tensors
+        self.N = len(self.data)
+        self.num_negatives = num_negatives
+        self.num_to_mix = num_to_mix
+        
+        # Convert tabular data columns to float32 arrays (using the prefixes)
         self.micro_data = data.filter(like='Microbiome_').astype(np.float32).values
         self.biom_data  = data.filter(like='Biomarker_').astype(np.float32).values
         self.other_data = data.filter(like='Other_').astype(np.float32).values
 
-        # Print dataset sizes and shapes
-        print("Original dataset size (CSV rows):", len(self.data))
-        print("Dataset size after adding positive and negative pairs: ", len(self.data))
+        # Optionally store patient/time info (for debugging)
+        self.patient_ids = data['Patient_ID'].values
+        self.timepoints = data['Timepoint'].values
+
+        print("CSV data size (before pairing):", self.N)
+        total_samples = self.N * (1 + self.num_negatives)
+        print("Dataset size (after separating positive and negative samples):", total_samples)
         print("Micro data shape:", self.micro_data.shape)
         print("Biom data shape:", self.biom_data.shape)
         print("Other data shape:", self.other_data.shape)
         self._printed_example = False
 
     def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        # --------- Positive sample ---------
-        row = self.data.iloc[idx]
+        return self.N * (self.num_negatives + 1)
+
+    def __getitem__(self, index):
+        # Determine which original row and which sample type.
+        row_index = index // (self.num_negatives + 1)
+        sample_type = index % (self.num_negatives + 1)
+        row = self.data.iloc[row_index]
         patient_id = str(row['Patient_ID'])
-        timepoint  = str(row['Timepoint'])
+        timepoint = str(row['Timepoint'])
         mri_tensor = self.mri_dict.get(
             (patient_id, timepoint),
-            torch.zeros((1,128,128,128), dtype=torch.float32)  # fallback if MRI not found
+            torch.zeros((1, 128, 128, 128), dtype=torch.float32)
         )
-        micro_tensor = torch.tensor(self.micro_data[idx], dtype=torch.float32)
-        biom_tensor  = torch.tensor(self.biom_data[idx], dtype=torch.float32)
-        other_tensor = torch.tensor(self.other_data[idx], dtype=torch.float32)
-        pid_code = self.patient_ids[idx]
-        t_code   = self.timepoints[idx]
-        positive = (mri_tensor, micro_tensor, biom_tensor, other_tensor, pid_code, t_code)
+        # Get the tabular data from the current row
+        micro_tensor = torch.tensor(self.micro_data[row_index], dtype=torch.float32)
+        biom_tensor  = torch.tensor(self.biom_data[row_index], dtype=torch.float32)
+        other_tensor = torch.tensor(self.other_data[row_index], dtype=torch.float32)
         
-        # --------- Negative sample ---------
-        # Choose a row from a different patient
-        neg_idx = idx
-        while True:
-            neg_idx = np.random.randint(0, len(self.data))
-            if str(self.data.iloc[neg_idx]['Patient_ID']) != patient_id:
-                break
-        # Use the same MRI but apply a 90° rotation (rotate along the H and W dimensions)
-        neg_mri = torch.rot90(mri_tensor, k=1, dims=(2,3))
-        neg_micro = torch.tensor(self.micro_data[neg_idx], dtype=torch.float32)
-        neg_biom  = torch.tensor(self.biom_data[neg_idx], dtype=torch.float32)
-        neg_other = torch.tensor(self.other_data[neg_idx], dtype=torch.float32)
-        neg_pid   = self.patient_ids[neg_idx]
-        neg_time  = self.timepoints[neg_idx]
-        negative = (neg_mri, neg_micro, neg_biom, neg_other, neg_pid, neg_time)
+        if sample_type == 0:
+            # Positive sample: all modalities come from the same observation.
+            label = 1
+            sample_mri = mri_tensor
+            sample_micro = micro_tensor
+            sample_biom = biom_tensor
+            sample_other = other_tensor
+        else:
+            # Negative sample: use the rotated MRI from the current row,
+            # but mix tabular data from num_to_mix different random rows.
+            label = 0
+            sample_mri = torch.rot90(mri_tensor, k=1, dims=(2,3))
+            neg_micro_vals = []
+            neg_biom_vals = []
+            neg_other_vals = []
+            for _ in range(self.num_to_mix):
+                neg_row = row_index
+                while neg_row == row_index:
+                    neg_row = np.random.randint(0, self.N)
+                neg_micro_vals.append(self.micro_data[neg_row])
+                neg_biom_vals.append(self.biom_data[neg_row])
+                neg_other_vals.append(self.other_data[neg_row])
+            neg_micro_avg = np.mean(neg_micro_vals, axis=0)
+            neg_biom_avg = np.mean(neg_biom_vals, axis=0)
+            neg_other_avg = np.mean(neg_other_vals, axis=0)
+            sample_micro = torch.tensor(neg_micro_avg, dtype=torch.float32)
+            sample_biom = torch.tensor(neg_biom_avg, dtype=torch.float32)
+            sample_other = torch.tensor(neg_other_avg, dtype=torch.float32)
         
-        # Print an example pair (only once for the first sample)
-        if idx == 0 and not self._printed_example:
-            print("\n--- Example Pair from Dataset Index 0 ---")
-            print("Positive sample:")
-            print(" MRI tensor shape:", positive[0].shape)
-            print(" Micro data sample:", positive[1])
-            print(" Biomarker data sample:", positive[2])
-            print(" Other data sample:", positive[3])
-            print("Negative sample (MRI rotated):")
-            print(" MRI tensor shape:", negative[0].shape)
-            print(" Micro data sample:", negative[1])
-            print(" Biomarker data sample:", negative[2])
-            print(" Other data sample:", negative[3])
+        # Optionally print an example from the first observation's samples.
+        if index < (self.num_negatives + 1) and not self._printed_example:
+            sample_type_str = "Positive" if label == 1 else "Negative"
+            print("\n--- Example from Dataset ---")
+            print(f"{sample_type_str} sample (label={label}):")
+            print(" MRI tensor shape:", sample_mri.shape)
+            print(" Micro data sample:", sample_micro)
+            print(" Biomarker data sample:", sample_biom)
+            print(" Other data sample:", sample_other)
             print("----------------------------------------\n")
             self._printed_example = True
 
-        return positive, negative
+        return {
+            "mri": sample_mri,
+            "micro": sample_micro,
+            "biom": sample_biom,
+            "other": sample_other,
+            "label": torch.tensor(label, dtype=torch.float32)
+        }
 
-# ==============================
-# 🚀 CLIP-BASED MRI ENCODER (unchanged)
-# ==============================
+#############################################
+# ENCODERS
+#############################################
 class MRIClipEncoder(nn.Module):
     """
-    Takes (batch, 1, D, H, W) MRI, extracts a 2D slice,
-    runs it through CLIP, then projects 512-d -> embed_dim.
+    MRI Encoder: Extracts a middle 2D slice from a 3D MRI, converts it to a PIL image,
+    processes it through CLIP, and projects the resulting 512-d embedding to embed_dim.
     """
     def __init__(self, embed_dim=32, device="cpu"):
         super().__init__()
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         self.device = device
-
         self.project = nn.Sequential(
             nn.Linear(512, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim)
         )
-
+    
     def forward(self, mri_batch):
         b_size = mri_batch.size(0)
         embeddings = []
@@ -227,13 +234,11 @@ class MRIClipEncoder(nn.Module):
             volume_3d = mri_batch[i, 0]  # shape: (D, H, W)
             D = volume_3d.shape[0]
             mid_slice_idx = D // 2
-            slice_2d = volume_3d[mid_slice_idx]  # (H, W)
-            # Normalize to [0,255]
+            slice_2d = volume_3d[mid_slice_idx]
             arr_np = slice_2d.cpu().numpy()
             rng = np.ptp(arr_np)
             arr_np = (arr_np - arr_np.min()) / (rng + 1e-8)
             arr_np = (arr_np * 255).astype(np.uint8)
-            # Convert to PIL image (RGB)
             pil_img = Image.fromarray(arr_np, mode='L').convert("RGB")
             inputs = self.processor(
                 images=pil_img,
@@ -249,10 +254,10 @@ class MRIClipEncoder(nn.Module):
             embeddings.append(out)
         return torch.cat(embeddings, dim=0)
 
-# ==============================
-# 🚀 MLP ENCODER FOR TABULAR DATA (unchanged)
-# ==============================
 class MLPEncoder(nn.Module):
+    """
+    Simple MLP Encoder for tabular data.
+    """
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -260,177 +265,133 @@ class MLPEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(128, output_dim)
         )
+    
     def forward(self, x):
         return F.normalize(self.encoder(x), p=2, dim=-1)
 
-# ==============================
-# 🚀 PATIENT CONTRASTIVE LOSS (for positive pairs)
-# ==============================
-def explicit_patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, patient_ids, tau=0.1):
-    B, D = e_mri.shape  # (batch, embed_dim)
-    embeddings = torch.cat([e_mri, e_micro, e_biom, e_other], dim=0)  # shape: (B*4, embed_dim)
-    sim_matrix = torch.matmul(embeddings, embeddings.t()) / tau
-    sim_exp = torch.exp(sim_matrix)
-    repeated_ids = patient_ids.repeat(4)
-    diag_mask = torch.eye(B*4, dtype=torch.bool, device=sim_matrix.device)
-    same_mask = (repeated_ids.unsqueeze(0) == repeated_ids.unsqueeze(1)) & (~diag_mask)
-    diff_mask = (repeated_ids.unsqueeze(0) != repeated_ids.unsqueeze(1)) & (~diag_mask)
-    pos_sim = sim_exp * same_mask.float()
-    sum_pos = pos_sim.sum(dim=1)
-    neg_sim = sim_exp * diff_mask.float()
-    sum_neg = neg_sim.sum(dim=1)
-    eps = 1e-8
-    loss = -torch.log((sum_pos + eps) / (sum_pos + sum_neg + eps))
-    return loss.mean()
-
-# ==============================
-# 🚀 TRAINING LOOP WITH NEGATIVE PAIRS INCLUDED
-# ==============================
-def train_one_epoch(
-    mri_encoder, micro_encoder, biom_encoder, other_encoder,
-    dataloader, optimizer, device="cpu", tau=0.1
-):
+#############################################
+# TRAINING AND VALIDATION FUNCTIONS
+#############################################
+def train_one_epoch_separate(mri_encoder, micro_encoder, biom_encoder, other_encoder,
+                             dataloader, optimizer, device="cpu"):
     mri_encoder.train()
     micro_encoder.train()
     biom_encoder.train()
     other_encoder.train()
 
     running_loss = 0.0
-    margin = 0.2
-    cos_sim = nn.CosineSimilarity(dim=-1)
+    bce_loss = nn.BCELoss()
 
     for batch in dataloader:
-        # Each batch item is a tuple: (positive, negative)
-        pos_batch, neg_batch = batch  # unpack positive and negative lists
-        pos_mri, pos_micro, pos_biom, pos_other, pos_pids, _ = zip(*pos_batch)
-        pos_mri   = torch.stack(pos_mri).to(device)
-        pos_micro = torch.stack(pos_micro).to(device)
-        pos_biom  = torch.stack(pos_biom).to(device)
-        pos_other = torch.stack(pos_other).to(device)
-        pos_pids  = torch.stack(pos_pids).to(device)
+        mri_batch = batch["mri"].to(device)
+        micro_batch = batch["micro"].to(device)
+        biom_batch = batch["biom"].to(device)
+        other_batch = batch["other"].to(device)
+        labels = batch["label"].to(device)
 
-        neg_mri, neg_micro, neg_biom, neg_other, neg_pids, _ = zip(*neg_batch)
-        neg_mri   = torch.stack(neg_mri).to(device)
-        neg_micro = torch.stack(neg_micro).to(device)
-        neg_biom  = torch.stack(neg_biom).to(device)
-        neg_other = torch.stack(neg_other).to(device)
-        neg_pids  = torch.stack(neg_pids).to(device)
+        e_mri = mri_encoder(mri_batch)
+        e_micro = micro_encoder(micro_batch)
+        e_biom = biom_encoder(biom_batch)
+        e_other = other_encoder(other_batch)
+        # Average tabular embeddings
+        e_tabular = (e_micro + e_biom + e_other) / 3
 
-        # Compute embeddings for positive samples:
-        e_mri_pos   = mri_encoder(pos_mri)
-        e_micro_pos = micro_encoder(pos_micro)
-        e_biom_pos  = biom_encoder(pos_biom)
-        e_other_pos = other_encoder(pos_other)
-        pos_loss = explicit_patient_contrastive_loss(e_mri_pos, e_micro_pos, e_biom_pos, e_other_pos, pos_pids, tau=tau)
+        cos_sim = F.cosine_similarity(e_mri, e_tabular, dim=-1)
+        pred = (cos_sim + 1) / 2
 
-        # Compute embeddings for negative samples:
-        e_mri_neg   = mri_encoder(neg_mri)
-        e_micro_neg = micro_encoder(neg_micro)
-        e_biom_neg  = biom_encoder(neg_biom)
-        e_other_neg = other_encoder(neg_other)
-        sim_mri_micro = cos_sim(e_mri_neg, e_micro_neg)
-        sim_mri_biom  = cos_sim(e_mri_neg, e_biom_neg)
-        sim_mri_other = cos_sim(e_mri_neg, e_other_neg)
-        neg_loss = (F.relu(sim_mri_micro - margin).mean() +
-                    F.relu(sim_mri_biom  - margin).mean() +
-                    F.relu(sim_mri_other - margin).mean()) / 3
-
-        loss = pos_loss + neg_loss
-
+        loss = bce_loss(pred, labels)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         running_loss += loss.item()
-
+    
     return running_loss / len(dataloader)
 
-def validate_one_epoch(
-    mri_encoder, micro_encoder, biom_encoder, other_encoder,
-    dataloader, device="cpu", tau=0.1
-):
+def validate_one_epoch_separate(mri_encoder, micro_encoder, biom_encoder, other_encoder,
+                                dataloader, device="cpu"):
     mri_encoder.eval()
     micro_encoder.eval()
     biom_encoder.eval()
     other_encoder.eval()
 
     running_loss = 0.0
+    bce_loss = nn.BCELoss()
+
     with torch.no_grad():
         for batch in dataloader:
-            pos_batch, _ = batch  # Only use positive pairs for validation
-            pos_mri, pos_micro, pos_biom, pos_other, pos_pids, _ = zip(*pos_batch)
-            pos_mri   = torch.stack(pos_mri).to(device)
-            pos_micro = torch.stack(pos_micro).to(device)
-            pos_biom  = torch.stack(pos_biom).to(device)
-            pos_other = torch.stack(pos_other).to(device)
-            pos_pids  = torch.stack(pos_pids).to(device)
-            e_mri   = mri_encoder(pos_mri)
-            e_micro = micro_encoder(pos_micro)
-            e_biom  = biom_encoder(pos_biom)
-            e_other = other_encoder(pos_other)
-            loss = explicit_patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, pos_pids, tau=tau)
-            running_loss += loss.item()
+            mri_batch = batch["mri"].to(device)
+            micro_batch = batch["micro"].to(device)
+            biom_batch = batch["biom"].to(device)
+            other_batch = batch["other"].to(device)
+            labels = batch["label"].to(device)
 
+            e_mri = mri_encoder(mri_batch)
+            e_micro = micro_encoder(micro_batch)
+            e_biom = biom_encoder(biom_batch)
+            e_other = other_encoder(other_batch)
+            e_tabular = (e_micro + e_biom + e_other) / 3
+
+            cos_sim = F.cosine_similarity(e_mri, e_tabular, dim=-1)
+            pred = (cos_sim + 1) / 2
+
+            loss = bce_loss(pred, labels)
+            running_loss += loss.item()
+    
     return running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
 
-# ==============================
-# 🚀 TRAIN MODEL WITH EARLY STOPPING
-# ==============================
-def train_model(data, mri_dict, embed_dim=32, epochs=100, batch_size=3, lr=1e-4):
+#############################################
+# TRAINING FUNCTION
+#############################################
+def train_model(data, mri_dict, embed_dim=32, epochs=100, batch_size=3, lr=1e-4, num_negatives=300):
     print("CSV data size (before pairing):", len(data))
-    # Create our dataset that returns (positive, negative) pairs
-    dataset = PatientContrastiveDataset(data, mri_dict)
-    print("Dataset size (after pairing):", len(dataset))
+    dataset = PatientContrastiveDatasetSeparate(data, mri_dict, num_negatives=num_negatives, num_to_mix=3)
+    print("Dataset size (after separation):", len(dataset))
     
     total_size = len(dataset)
-    val_size   = int(0.2 * total_size)
+    val_size = int(0.2 * total_size)
     train_size = total_size - val_size
-
-    train_set, val_set = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+    train_set, val_set = random_split(dataset, [train_size, val_size],
+                                      generator=torch.Generator().manual_seed(42))
     print(f"Training set size: {train_size} | Validation set size: {val_size}")
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, collate_fn=lambda b: list(zip(*b)))
-    val_loader   = DataLoader(val_set, batch_size=batch_size, shuffle=False, collate_fn=lambda b: list(zip(*b)))
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     micro_dim = dataset.micro_data.shape[1]
-    biom_dim  = dataset.biom_data.shape[1]
+    biom_dim = dataset.biom_data.shape[1]
     other_dim = dataset.other_data.shape[1]
 
     micro_encoder = MLPEncoder(micro_dim, embed_dim).to(device)
-    biom_encoder  = MLPEncoder(biom_dim,  embed_dim).to(device)
+    biom_encoder = MLPEncoder(biom_dim, embed_dim).to(device)
     other_encoder = MLPEncoder(other_dim, embed_dim).to(device)
-    mri_encoder   = MRIClipEncoder(embed_dim=embed_dim, device=device).to(device)
+    mri_encoder = MRIClipEncoder(embed_dim=embed_dim, device=device).to(device)
 
-    params = (list(micro_encoder.parameters()) +
-              list(biom_encoder.parameters())  +
-              list(other_encoder.parameters()) +
-              list(mri_encoder.parameters()))
+    params = list(mri_encoder.parameters()) + list(micro_encoder.parameters()) + \
+             list(biom_encoder.parameters()) + list(other_encoder.parameters())
     optimizer = torch.optim.Adam(params, lr=lr)
 
     train_losses, val_losses = [], []
     patience = 3
-    for epoch in range(1, epochs+1):
-        train_loss = train_one_epoch(
-            mri_encoder, micro_encoder, biom_encoder, other_encoder,
-            train_loader, optimizer, device=device, tau=0.1
-        )
-        val_loss = validate_one_epoch(
-            mri_encoder, micro_encoder, biom_encoder, other_encoder,
-            val_loader, device=device, tau=0.1
-        )
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch_separate(mri_encoder, micro_encoder, biom_encoder, other_encoder,
+                                              train_loader, optimizer, device=device)
+        val_loss = validate_one_epoch_separate(mri_encoder, micro_encoder, biom_encoder, other_encoder,
+                                               val_loader, device=device)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         print(f"Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        if len(val_losses) >= patience and min(val_losses[-patience:]) > (min(val_losses[:-patience], default=float('inf')) - 1e-4):
+        if epoch >= patience and min(val_losses[-patience:]) > (min(val_losses[:-patience], default=float('inf')) - 1e-4):
             print(f"Early stopping triggered at epoch {epoch}.")
             break
 
     final_epoch = len(train_losses)
-    x_axis = range(1, final_epoch+1)
-    plt.figure(figsize=(7,5))
+    x_axis = range(1, final_epoch + 1)
+    plt.figure(figsize=(7, 5))
     plt.plot(x_axis, train_losses, '-o', label='Train Loss')
-    plt.plot(x_axis, val_losses,   '-x', label='Val Loss')
-    plt.title("Multi-Modal Contrastive (CLIP + Tabular) with Explicit Negative Pairs")
+    plt.plot(x_axis, val_losses, '-x', label='Val Loss')
+    plt.title("Contrastive Training with Multiple Negative Samples")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
@@ -439,10 +400,11 @@ def train_model(data, mri_dict, embed_dim=32, epochs=100, batch_size=3, lr=1e-4)
     plt.close()
     print("Saved training and validation loss to 'train_val_loss.png'.")
 
-# ==============================
-# RUN
-# ==============================
+#############################################
+# MAIN
+#############################################
 if __name__ == "__main__":
     data = load_data()
     mri_dict = load_mri_data("/Users/thongnguyen/Downloads/CBF_imaging")
-    train_model(data, mri_dict, embed_dim=32, epochs=100, batch_size=3, lr=1e-4)
+    # Adjust num_negatives as desired; here, num_negatives=300 will yield a large dataset.
+    train_model(data, mri_dict, embed_dim=32, epochs=100, batch_size=3, lr=1e-4, num_negatives=300)
