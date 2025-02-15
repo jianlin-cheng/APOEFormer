@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import itertools
+import random
 
 import nibabel as nib
 import torch
@@ -12,6 +13,13 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
+
+# Additional imports for scaling and PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+# Sklearn metrics (we compute recall and AUC)
+from sklearn.metrics import recall_score, roc_auc_score
 
 #############################################
 # DATA LOADING FUNCTIONS
@@ -25,7 +33,6 @@ def load_data():
         except FileNotFoundError:
             print(f"File not found: {file_path}")
             return pd.DataFrame()
-    
     # Update paths as needed
     microbiome = load_file('/home/tmnthc/New/Microbiome.csv')
     blood_metabolites = load_file('/home/tmnthc/New/Blood_Metabolites.csv')
@@ -42,8 +49,7 @@ def load_data():
         else:
             print(f"{name} data loaded with shape: {df.shape}")
 
-    # Do not drop APOE4 because it is used as the supervised label.
-    
+    # Do not drop APOE4 because it is used downstream.
     for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]:
         if 'Patient_ID' in df.columns:
             df['Patient_ID'] = df['Patient_ID'].astype(str).str.strip()
@@ -76,7 +82,7 @@ def load_data():
     
     data = other_numeric.copy()
     for numeric_df in [microbiome_numeric, blood_metabolites_numeric, inflammatory_markers_numeric, blood_data_numeric]:
-        data = data.merge(numeric_df, on=['Patient_ID', 'Timepoint'], how='inner')
+        data = data.merge(numeric_df, on=['Patient_ID', 'Timepoint'], how='outer')
     
     data.fillna(0, inplace=True)
     print(f"Final merged data shape: {data.shape}")
@@ -164,39 +170,30 @@ class MLPEncoder(nn.Module):
 #############################################
 class CombinedContrastiveDataset(Dataset):
     """
-    Precompute a list of "combined" samples.
+    Precompute a list of combined samples.
     
-    Positive samples: For each observation (row) use (i, i, i, i) meaning that all modalities
-    are taken from the same row. Label = 1.
+    Positive samples: For each row, (i, i, i, i) meaning all modalities from the same row. Label = 1.
     
-    Negative samples: Create combinations where each modality comes from a different observation.
-    For example, (i, j, k, l) where i, j, k, l are distinct indices with distinct Patient_IDs.
-    Label = 0.
-    
-    The __getitem__ uses these precomputed indices to load data from the merged DataFrame and MRI dictionary.
+    Negative samples: For each negative sample, we generate a tuple of 4 indices
+    (with possible repetitions) such that not all 4 are the same.
+    This allows, for example, 2 indices from one patient and 2 from another.
     """
     def __init__(self, data, mri_dict, negative_sample_fraction=1.0):
         self.data = data.reset_index(drop=True)
         self.mri_dict = mri_dict
         self.N = len(self.data)
         
-        # Positive samples: (i, i, i, i) for each observation.
+        # Positive samples: (i, i, i, i) for each row.
         self.positive_samples = [(i, i, i, i) for i in range(self.N)]
         
-        # Negative samples: precompute all combinations of 4 distinct indices where patient IDs are distinct.
-        all_indices = list(range(self.N))
+        # Negative samples: generate a fixed number of negatives by random sampling.
+        num_negatives = int(self.N * negative_sample_fraction)
         negative_samples = []
-        for comb in itertools.combinations(all_indices, 4):
-            # Check that the Patient_IDs for these indices are all distinct.
-            p_ids = [self.data.loc[idx, 'Patient_ID'] for idx in comb]
-            if len(set(p_ids)) == 4:
-                negative_samples.append(comb)
-        print("Total negative combinations (before sampling):", len(negative_samples))
-        if negative_sample_fraction < 1.0:
-            np.random.shuffle(negative_samples)
-            new_len = int(len(negative_samples) * negative_sample_fraction)
-            negative_samples = negative_samples[:new_len]
-            print("Negative combinations after subsampling:", len(negative_samples))
+        while len(negative_samples) < num_negatives:
+            sample = [random.choice(range(self.N)) for _ in range(4)]
+            # Ensure not all indices are identical (to avoid being a positive sample)
+            if len(set(sample)) > 1:
+                negative_samples.append(tuple(sample))
         self.negative_samples = negative_samples
         
         self.samples = [(sample, 1) for sample in self.positive_samples] + [(sample, 0) for sample in self.negative_samples]
@@ -208,12 +205,10 @@ class CombinedContrastiveDataset(Dataset):
     def __getitem__(self, index):
         indices, label = self.samples[index]
         i, j, k, l = indices
-        # Load MRI from observation i.
         patient_id_i = str(self.data.loc[i, 'Patient_ID'])
         timepoint_i = str(self.data.loc[i, 'Timepoint'])
-        mri_tensor = self.mri_dict.get((patient_id_i, timepoint_i), 
+        mri_tensor = self.mri_dict.get((patient_id_i, timepoint_i),
                                        torch.zeros((1, 128, 128, 128), dtype=torch.float32))
-        # Load tabular data for modalities from rows j, k, l.
         micro_tensor = torch.tensor(self.data.filter(like='Microbiome_').iloc[j].values.astype(np.float32))
         biom_tensor = torch.tensor(self.data.filter(like='Biomarker_').iloc[k].values.astype(np.float32))
         other_tensor = torch.tensor(self.data.filter(like='Other_').iloc[l].values.astype(np.float32))
@@ -226,89 +221,119 @@ class CombinedContrastiveDataset(Dataset):
         }
 
 #############################################
-# SUPERVISED DATASET FOR APOE4 PREDICTION
+# EVALUATION DATASET: POSITIVE SAMPLES ONLY
 #############################################
-class SupervisedDataset(Dataset):
+class PositiveIndividualModalityDataset(Dataset):
+    """
+    This dataset splits each positive row into individual modality samples.
+    Each sample has a group_label (Patient_ID+Timepoint) and a full_label (including modality).
+    """
     def __init__(self, data, mri_dict):
         self.data = data.reset_index(drop=True)
         self.mri_dict = mri_dict
-        self.N = len(self.data)
-        self.micro_data = data.filter(like='Microbiome_').astype(np.float32).values
-        self.biom_data = data.filter(like='Biomarker_').astype(np.float32).values
-        self.other_data = data.filter(like='Other_').astype(np.float32).values
-        self.labels = data['APOE4'].values.astype(np.float32)
-        print("Supervised dataset size:", self.N)
+        self.modalities = ["mri", "micro", "biom", "other"]
     
     def __len__(self):
-        return self.N
+        return len(self.data) * len(self.modalities)
     
-    def __getitem__(self, index):
-        row = self.data.iloc[index]
-        patient_id = str(row['Patient_ID'])
-        timepoint = str(row['Timepoint'])
-        mri_tensor = self.mri_dict.get((patient_id, timepoint),
-                                       torch.zeros((1, 128, 128, 128), dtype=torch.float32))
-        micro_tensor = torch.tensor(self.micro_data[index], dtype=torch.float32)
-        biom_tensor = torch.tensor(self.biom_data[index], dtype=torch.float32)
-        other_tensor = torch.tensor(self.other_data[index], dtype=torch.float32)
-        label = torch.tensor(self.labels[index], dtype=torch.float32)
+    def __getitem__(self, idx):
+        row_idx = idx // len(self.modalities)
+        modality_idx = idx % len(self.modalities)
+        modality = self.modalities[modality_idx]
+        patient_id = str(self.data.loc[row_idx, 'Patient_ID'])
+        timepoint = str(self.data.loc[row_idx, 'Timepoint'])
+        group_label = f"{patient_id}_{timepoint}"
+        if modality == "mri":
+            data_point = self.mri_dict.get((patient_id, timepoint),
+                                           torch.zeros((1,128,128,128), dtype=torch.float32))
+        elif modality == "micro":
+            data_point = torch.tensor(self.data.filter(like='Microbiome_').iloc[row_idx].values.astype(np.float32))
+        elif modality == "biom":
+            data_point = torch.tensor(self.data.filter(like='Biomarker_').iloc[row_idx].values.astype(np.float32))
+        elif modality == "other":
+            data_point = torch.tensor(self.data.filter(like='Other_').iloc[row_idx].values.astype(np.float32))
+        full_label = f"{group_label}_{modality}"
         return {
-            "mri": mri_tensor,
-            "micro": micro_tensor,
-            "biom": biom_tensor,
-            "other": other_tensor,
-            "label": label
+            "data": data_point,
+            "group_label": group_label,
+            "modality_label": modality,
+            "full_label": full_label
         }
 
+# Custom collate function for variable shapes
+def custom_collate_fn(batch):
+    out = {}
+    for key in batch[0]:
+        out[key] = [d[key] for d in batch]
+    return out
+
 #############################################
-# MODEL: MULTI-MODAL ATTENTION PREDICTOR (SUPERVISED HEAD)
+# PLOTTING HELPERS
 #############################################
-class MultiModalAttentionPredictor(nn.Module):
-    def __init__(self, mri_encoder, micro_encoder, biom_encoder, other_encoder,
-                 embed_dim=32, hidden_dim=64, output_dim=1):
-        super().__init__()
-        self.mri_encoder = mri_encoder
-        self.micro_encoder = micro_encoder
-        self.biom_encoder = biom_encoder
-        self.other_encoder = other_encoder
-        
-        self.attention = nn.Linear(embed_dim, 1)
-        self.classifier = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
+def plot_metrics(train_metrics, val_metrics, epochs):
+    # Unpack metrics (loss, recall, AUC)
+    train_losses = [m[0] for m in train_metrics]
+    train_recs   = [m[1] for m in train_metrics]
+    train_aucs   = [m[2] for m in train_metrics]
     
-    def forward(self, mri, micro, biom, other):
-        e_mri = self.mri_encoder(mri)         # (B, embed_dim)
-        e_micro = self.micro_encoder(micro)   # (B, embed_dim)
-        e_biom = self.biom_encoder(biom)      # (B, embed_dim)
-        e_other = self.other_encoder(other)   # (B, embed_dim)
-        modalities = torch.stack([e_mri, e_micro, e_biom, e_other], dim=1)  # (B, 4, embed_dim)
-        attn_scores = self.attention(modalities)  # (B, 4, 1)
-        attn_weights = torch.softmax(attn_scores, dim=1)
-        fused_embedding = torch.sum(attn_weights * modalities, dim=1)  # (B, embed_dim)
-        logits = self.classifier(fused_embedding)
-        return logits, attn_weights
+    val_losses = [m[0] for m in val_metrics]
+    val_recs   = [m[1] for m in val_metrics]
+    val_aucs   = [m[2] for m in val_metrics]
+    
+    epochs_range = range(1, epochs+1)
+
+    # Loss Plot
+    plt.figure(figsize=(8,6))
+    plt.plot(epochs_range, train_losses, label='Train Loss')
+    plt.plot(epochs_range, val_losses, label='Val Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training & Validation Loss')
+    plt.legend()
+    plt.savefig('loss.png', dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    # Recall Plot
+    plt.figure(figsize=(8,6))
+    plt.plot(epochs_range, train_recs, label='Train Recall')
+    plt.plot(epochs_range, val_recs, label='Val Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Recall')
+    plt.title('Training & Validation Recall')
+    plt.legend()
+    plt.savefig('recall.png', dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    # AUC Plot
+    plt.figure(figsize=(8,6))
+    plt.plot(epochs_range, train_aucs, label='Train AUC')
+    plt.plot(epochs_range, val_aucs, label='Val AUC')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUC')
+    plt.title('Training & Validation AUC')
+    plt.legend()
+    plt.savefig('auc.png', dpi=300, bbox_inches="tight")
+    plt.close()
 
 #############################################
 # SELF-SUPERVISED PRETRAINING FUNCTIONS
 #############################################
 def train_pretrain_epoch(model_dict, dataloader, optimizer, device="cpu"):
-    # Extract the modules from the dictionary.
     mri_encoder = model_dict["mri_encoder"]
     micro_encoder = model_dict["micro_encoder"]
     biom_encoder = model_dict["biom_encoder"]
     other_encoder = model_dict["other_encoder"]
     
-    # Set each to train mode.
     mri_encoder.train()
     micro_encoder.train()
     biom_encoder.train()
     other_encoder.train()
     
-    running_loss = 0.0
     bce_loss = nn.BCELoss()
+    running_loss = 0.0
+    
+    all_labels = []
+    all_preds = []
     
     for batch in dataloader:
         mri = batch["mri"].to(device)
@@ -321,17 +346,39 @@ def train_pretrain_epoch(model_dict, dataloader, optimizer, device="cpu"):
         e_micro = micro_encoder(micro)
         e_biom = biom_encoder(biom)
         e_other = other_encoder(other)
+        
         e_tabular = (e_micro + e_biom + e_other) / 3
         cos_sim = F.cosine_similarity(e_mri, e_tabular, dim=-1)
-        pred = (cos_sim + 1) / 2
+        pred = (cos_sim + 1) / 2  # range [0, 1]
+        
         loss = bce_loss(pred, labels)
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
         running_loss += loss.item()
-    return running_loss / len(dataloader)
+        
+        all_labels.extend(labels.detach().cpu().numpy())
+        all_preds.extend(pred.detach().cpu().numpy())
+    
+    epoch_loss = running_loss / len(dataloader)
+    binary_preds = [1 if p >= 0.5 else 0 for p in all_preds]
+    try:
+        epoch_rec = recall_score(all_labels, binary_preds, zero_division=0)
+        epoch_auc = roc_auc_score(all_labels, all_preds)
+    except ValueError:
+        epoch_rec = epoch_auc = 0.0
+    
+    return epoch_loss, epoch_rec, epoch_auc
 
 def validate_pretrain_epoch(model_dict, dataloader, device="cpu"):
+    bce_loss = nn.BCELoss()
+    running_loss = 0.0
+    
+    all_labels = []
+    all_preds = []
+    
     mri_encoder = model_dict["mri_encoder"]
     micro_encoder = model_dict["micro_encoder"]
     biom_encoder = model_dict["biom_encoder"]
@@ -342,9 +389,6 @@ def validate_pretrain_epoch(model_dict, dataloader, device="cpu"):
     biom_encoder.eval()
     other_encoder.eval()
     
-    running_loss = 0.0
-    bce_loss = nn.BCELoss()
-    
     with torch.no_grad():
         for batch in dataloader:
             mri = batch["mri"].to(device)
@@ -352,162 +396,322 @@ def validate_pretrain_epoch(model_dict, dataloader, device="cpu"):
             biom = batch["biom"].to(device)
             other = batch["other"].to(device)
             labels = batch["label"].to(device)
+            
             e_mri = mri_encoder(mri)
             e_micro = micro_encoder(micro)
             e_biom = biom_encoder(biom)
             e_other = other_encoder(other)
+            
             e_tabular = (e_micro + e_biom + e_other) / 3
             cos_sim = F.cosine_similarity(e_mri, e_tabular, dim=-1)
             pred = (cos_sim + 1) / 2
+            
             loss = bce_loss(pred, labels)
             running_loss += loss.item()
-    return running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
-
-#############################################
-# SUPERVISED FINETUNING FUNCTIONS
-#############################################
-def train_supervised_epoch(model, dataloader, optimizer, device="cpu"):
-    model.train()
-    running_loss = 0.0
-    bce_loss = nn.BCEWithLogitsLoss()
-    for batch in dataloader:
-        mri = batch["mri"].to(device)
-        micro = batch["micro"].to(device)
-        biom = batch["biom"].to(device)
-        other = batch["other"].to(device)
-        labels = batch["label"].to(device).unsqueeze(1)
-        logits, attn_weights = model(mri, micro, biom, other)
-        loss = bce_loss(logits, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item()
-    return running_loss / len(dataloader)
-
-def validate_supervised_epoch(model, dataloader, device="cpu"):
-    model.eval()
-    running_loss = 0.0
-    bce_loss = nn.BCEWithLogitsLoss()
-    with torch.no_grad():
-        for batch in dataloader:
-            mri = batch["mri"].to(device)
-            micro = batch["micro"].to(device)
-            biom = batch["biom"].to(device)
-            other = batch["other"].to(device)
-            labels = batch["label"].to(device).unsqueeze(1)
-            logits, attn_weights = model(mri, micro, biom, other)
-            loss = bce_loss(logits, labels)
-            running_loss += loss.item()
-    return running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
-
-#############################################
-# MAIN TRAINING FUNCTIONS
-#############################################
-def pretrain_model(data, mri_dict, embed_dim=32, epochs=5, batch_size=3, lr=1e-4):
-    # Use the CombinedContrastiveDataset that precomputes positive and negative samples.
-    dataset = CombinedContrastiveDataset(data, mri_dict, negative_sample_fraction=1.0)
-    total_size = len(dataset)
-    val_size = int(0.2 * total_size)
-    train_size = total_size - val_size
-    train_set, val_set = random_split(dataset, [train_size, val_size],
-                                      generator=torch.Generator().manual_seed(42))
-    print(f"Pretraining - Training set size: {train_size} | Validation set size: {val_size}")
+            
+            all_labels.extend(labels.detach().cpu().numpy())
+            all_preds.extend(pred.detach().cpu().numpy())
     
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    epoch_loss = running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    binary_preds = [1 if p >= 0.5 else 0 for p in all_preds]
+    try:
+        epoch_rec = recall_score(all_labels, binary_preds, zero_division=0)
+        epoch_auc = roc_auc_score(all_labels, all_preds)
+    except ValueError:
+        epoch_rec = epoch_auc = 0.0
+    
+    return epoch_loss, epoch_rec, epoch_auc
+
+def pretrain_model(data, mri_dict, embed_dim=32, epochs=5, batch_size=3, lr=1e-4):
+    # Select training and validation patients:
+    all_patients = np.unique(data['Patient_ID'])
+    if len(all_patients) < 19:
+        raise ValueError("Not enough patients. Need at least 19 patients.")
+    train_patient_ids = all_patients[:16]
+    val_patient_ids = all_patients[16:19]
+    print("Training Patient IDs:", train_patient_ids)
+    print("Validation Patient IDs:", val_patient_ids)
+    
+    train_data = data[data['Patient_ID'].isin(train_patient_ids)]
+    val_data = data[data['Patient_ID'].isin(val_patient_ids)]
+    
+    # For each patient, take the first 3 timepoints (sorted)
+    train_data = train_data.sort_values(['Patient_ID', 'Timepoint']).groupby('Patient_ID').head(3).reset_index(drop=True)
+    val_data = val_data.sort_values(['Patient_ID', 'Timepoint']).groupby('Patient_ID').head(3).reset_index(drop=True)
+    
+    print(f"Training data rows: {len(train_data)} (expected 16*3 = 48)")
+    print(f"Validation data rows: {len(val_data)} (expected 3*3 = 9)")
+    
+    # Create datasets
+    train_dataset = CombinedContrastiveDataset(train_data, mri_dict, negative_sample_fraction=100)
+    val_dataset = CombinedContrastiveDataset(val_data, mri_dict, negative_sample_fraction=100)
+    
+    print(f"Number of training combined samples: {len(train_dataset)}")
+    print(f"Number of validation combined samples: {len(val_dataset)}")
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create encoders using the merged data dimensions.
-    micro_dim = data.filter(like='Microbiome_').shape[1]
-    biom_dim = data.filter(like='Biomarker_').shape[1]
-    other_dim = data.filter(like='Other_').shape[1]
+    micro_dim = train_data.filter(like='Microbiome_').shape[1]
+    biom_dim = train_data.filter(like='Biomarker_').shape[1]
+    other_dim = train_data.filter(like='Other_').shape[1]
     micro_encoder = MLPEncoder(micro_dim, embed_dim).to(device)
     biom_encoder = MLPEncoder(biom_dim, embed_dim).to(device)
     other_encoder = MLPEncoder(other_dim, embed_dim).to(device)
     mri_encoder = MRIClipEncoder(embed_dim=embed_dim, device=device).to(device)
     
-    model_dict = {"mri_encoder": mri_encoder,
-                  "micro_encoder": micro_encoder,
-                  "biom_encoder": biom_encoder,
-                  "other_encoder": other_encoder}
+    model_dict = {
+        "mri_encoder": mri_encoder,
+        "micro_encoder": micro_encoder,
+        "biom_encoder": biom_encoder,
+        "other_encoder": other_encoder
+    }
     
     params = list(mri_encoder.parameters()) + list(micro_encoder.parameters()) + \
              list(biom_encoder.parameters()) + list(other_encoder.parameters())
     optimizer = torch.optim.Adam(params, lr=lr)
     
-    train_losses, val_losses = [], []
-    patience = 3
+    train_metrics = []
+    val_metrics = []
+    
     for epoch in range(1, epochs + 1):
-        train_loss = train_pretrain_epoch(model_dict, train_loader, optimizer, device=device)
-        val_loss = validate_pretrain_epoch(model_dict, val_loader, device=device)
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        print(f"Pretraining Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        if epoch >= patience and min(val_losses[-patience:]) > (min(val_losses[:-patience], default=float('inf')) - 1e-4):
-            print(f"Early stopping triggered at pretraining epoch {epoch}.")
-            break
+        (train_loss, train_rec, train_auc) = train_pretrain_epoch(model_dict, train_loader, optimizer, device=device)
+        (val_loss, val_rec, val_auc) = validate_pretrain_epoch(model_dict, val_loader, device=device)
+        
+        train_metrics.append((train_loss, train_rec, train_auc))
+        val_metrics.append((val_loss, val_rec, val_auc))
+        
+        print(f"Epoch {epoch}/{epochs} | "
+              f"Train Loss: {train_loss:.4f} Rec: {train_rec:.4f} AUC: {train_auc:.4f} | "
+              f"Val Loss: {val_loss:.4f} Rec: {val_rec:.4f} AUC: {val_auc:.4f}")
+    
+    # Save metric plots
+    plot_metrics(train_metrics, val_metrics, epochs)
+    
     return mri_encoder, micro_encoder, biom_encoder, other_encoder
 
-def supervised_finetune(data, mri_dict, mri_encoder, micro_encoder, biom_encoder, other_encoder,
-                         embed_dim=32, epochs=100, batch_size=3, lr=1e-4):
-    dataset = SupervisedDataset(data, mri_dict)
-    total_size = len(dataset)
-    val_size = int(0.2 * total_size)
-    train_size = total_size - val_size
-    train_set, val_set = random_split(dataset, [train_size, val_size],
-                                      generator=torch.Generator().manual_seed(42))
-    print(f"Supervised Finetuning - Training set size: {train_size} | Validation set size: {val_size}")
+#############################################
+# EVALUATION FUNCTIONS
+#############################################
+def knn_accuracy(embeddings, labels, k=5):
+    from sklearn.neighbors import KNeighborsClassifier
+    knn = KNeighborsClassifier(n_neighbors=k, metric='cosine')
+    knn.fit(embeddings, labels)
+    predictions = knn.predict(embeddings)
+    return np.mean(predictions == labels)
+
+def extract_individual_embeddings(model, dataloader, device="cpu"):
+    model.eval()
+    embeddings = []
+    group_labels = []
+    full_labels = []
+    with torch.no_grad():
+        for batch in dataloader:
+            for i in range(len(batch["data"])):
+                x = batch["data"][i].to(device)
+                group_label = batch["group_label"][i]
+                full_label = batch["full_label"][i]
+                modality = batch["modality_label"][i].lower()
+                if modality == "mri":
+                    emb = model.mri_encoder(x.unsqueeze(0))
+                elif modality == "micro":
+                    emb = model.micro_encoder(x.unsqueeze(0))
+                elif modality == "biom":
+                    emb = model.biom_encoder(x.unsqueeze(0))
+                elif modality == "other":
+                    emb = model.other_encoder(x.unsqueeze(0))
+                else:
+                    raise ValueError(f"Unknown modality: {modality}")
+                embeddings.append(emb.cpu().numpy())
+                group_labels.append(group_label)
+                full_labels.append(full_label)
+    embeddings = np.concatenate(embeddings, axis=0)
+    return embeddings, group_labels, full_labels
+
+def tsne_visualization_individual(embeddings, group_labels, full_labels, title="t-SNE Visualization"):
+    from sklearn.manifold import TSNE
+    # Improved t-SNE parameters
+    tsne = TSNE(n_components=2, perplexity=20, learning_rate=500, n_iter=1500, random_state=42)
+    tsne_embeddings = tsne.fit_transform(embeddings)
     
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    unique_groups = np.unique(group_labels)
+    cmap = plt.get_cmap('tab10', len(unique_groups))
+    group_color = {group: cmap(i) for i, group in enumerate(unique_groups)}
+    marker_dict = {"mri": "o", "micro": "s", "biom": "D", "other": "^"}
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = MultiModalAttentionPredictor(mri_encoder, micro_encoder, biom_encoder, other_encoder,
-                                          embed_dim=embed_dim, hidden_dim=64, output_dim=1).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    train_losses, val_losses = [], []
-    patience = 5
-    for epoch in range(1, epochs + 1):
-        train_loss = train_supervised_epoch(model, train_loader, optimizer, device=device)
-        val_loss = validate_supervised_epoch(model, val_loader, device=device)
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        print(f"Supervised Finetuning Epoch {epoch}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-        if epoch >= patience and min(val_losses[-patience:]) > (min(val_losses[:-patience], default=float('inf')) - 1e-4):
-            print(f"Early stopping triggered at supervised finetuning epoch {epoch}.")
-            break
-    
-    plt.figure(figsize=(7, 5))
-    x_axis = range(1, len(train_losses) + 1)
-    plt.plot(x_axis, train_losses, '-o', label='Train Loss')
-    plt.plot(x_axis, val_losses, '-x', label='Val Loss')
-    plt.title("Supervised Finetuning with Attention Fusion")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("supervised_train_val_loss.png")
+    plt.figure(figsize=(10,8))
+    plotted = {}
+    for i in range(len(tsne_embeddings)):
+        group = group_labels[i]
+        modality = full_labels[i].split('_')[-1].lower()
+        marker = marker_dict.get(modality, "o")
+        label = f"{group}_{modality}"
+        if label not in plotted:
+            plt.scatter(tsne_embeddings[i,0], tsne_embeddings[i,1],
+                        color=group_color[group], marker=marker, s=80, label=label)
+            plotted[label] = True
+        else:
+            plt.scatter(tsne_embeddings[i,0], tsne_embeddings[i,1],
+                        color=group_color[group], marker=marker, s=80)
+    plt.title(title)
+    plt.xlabel("t-SNE Dim 1")
+    plt.ylabel("t-SNE Dim 2")
+    plt.legend(title="Patient+Timepoint_Modality", bbox_to_anchor=(1.05,1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig("tsne_plot.png", dpi=300, bbox_inches="tight")
     plt.close()
-    print("Saved supervised training and validation loss to 'supervised_train_val_loss.png'.")
-    return model
+
+def umap_visualization_individual(embeddings, group_labels, full_labels, title="UMAP Visualization"):
+    import umap.umap_ as umap
+    # Improved UMAP parameters
+    umap_model = umap.UMAP(n_components=2, n_neighbors=10, min_dist=0.05, random_state=42)
+    umap_embeddings = umap_model.fit_transform(embeddings)
+    
+    unique_groups = np.unique(group_labels)
+    cmap = plt.get_cmap('tab10', len(unique_groups))
+    group_color = {group: cmap(i) for i, group in enumerate(unique_groups)}
+    marker_dict = {"mri": "o", "micro": "s", "biom": "D", "other": "^"}
+    
+    plt.figure(figsize=(10,8))
+    plotted = {}
+    for i in range(len(umap_embeddings)):
+        group = group_labels[i]
+        modality = full_labels[i].split('_')[-1].lower()
+        marker = marker_dict.get(modality, "o")
+        label = f"{group}_{modality}"
+        if label not in plotted:
+            plt.scatter(umap_embeddings[i,0], umap_embeddings[i,1],
+                        color=group_color[group], marker=marker, s=80, label=label)
+            plotted[label] = True
+        else:
+            plt.scatter(umap_embeddings[i,0], umap_embeddings[i,1],
+                        color=group_color[group], marker=marker, s=80)
+    plt.title(title)
+    plt.xlabel("UMAP Dim 1")
+    plt.ylabel("UMAP Dim 2")
+    plt.legend(title="Patient+Timepoint_Modality", bbox_to_anchor=(1.05,1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig("umap_plot.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+def run_analysis_individual(model, dataloader, device="cpu", k=1):
+    embeddings, group_labels, full_labels = extract_individual_embeddings(model, dataloader, device)
+    # Standardize embeddings
+    scaler = StandardScaler()
+    embeddings_scaled = scaler.fit_transform(embeddings)
+    if embeddings_scaled.shape[0] >= 50:
+        pca = PCA(n_components=50, whiten=True)
+        reduced_embeddings = pca.fit_transform(embeddings_scaled)
+    else:
+        reduced_embeddings = embeddings_scaled
+    # Further normalize each embedding to unit norm
+    normalized_embeddings = reduced_embeddings / np.linalg.norm(reduced_embeddings, axis=1, keepdims=True)
+    
+    acc = knn_accuracy(normalized_embeddings, group_labels, k)
+    print(f"KNN Accuracy (grouped by patient+timepoint) with k={k}: {acc*100:.2f}%")
+    tsne_visualization_individual(normalized_embeddings, group_labels, full_labels,
+                                  title="t-SNE Visualization of Individual Embeddings")
+    umap_visualization_individual(normalized_embeddings, group_labels, full_labels,
+                                  title="UMAP Visualization of Individual Embeddings")
 
 #############################################
-# MAIN
+# MAIN TRAINING AND EVALUATION
 #############################################
 if __name__ == "__main__":
     data = load_data()
     mri_dict = load_mri_data("/home/tmnthc/CBF_imaging")
     
     print("\n===== SELF-SUPERVISED PRETRAINING =====")
-    mri_encoder, micro_encoder, biom_encoder, other_encoder = pretrain_model(
-        data, mri_dict, embed_dim=32, epochs=5, batch_size=3, lr=1e-4
-    )
+    # Pretrain on 16 patients (each with 3 timepoints) and validate on 3 patients (each with 3 timepoints)
+    all_patients = np.unique(data['Patient_ID'])
+    if len(all_patients) < 19:
+        raise ValueError("Not enough patients in data. Need at least 19 patients.")
+    train_patient_ids = all_patients[:16]
+    val_patient_ids = all_patients[16:19]
+    print("Training Patient IDs:", train_patient_ids)
+    print("Validation Patient IDs:", val_patient_ids)
     
-    print("\n===== SUPERVISED FINETUNING =====")
-    model = supervised_finetune(
-        data, mri_dict,
-        mri_encoder, micro_encoder, biom_encoder, other_encoder,
-        embed_dim=32, epochs=100, batch_size=3, lr=1e-4
-    )
+    train_data = data[data['Patient_ID'].isin(train_patient_ids)]
+    val_data = data[data['Patient_ID'].isin(val_patient_ids)]
+    
+    # Sort by Patient_ID and Timepoint, take first 3 timepoints per patient
+    train_data = train_data.sort_values(['Patient_ID', 'Timepoint']).groupby('Patient_ID').head(3).reset_index(drop=True)
+    val_data = val_data.sort_values(['Patient_ID', 'Timepoint']).groupby('Patient_ID').head(3).reset_index(drop=True)
+    
+    print(f"Training data rows: {len(train_data)} (expected 16*3 = 48)")
+    print(f"Validation data rows: {len(val_data)} (expected 3*3 = 9)")
+    
+    train_dataset = CombinedContrastiveDataset(train_data, mri_dict, negative_sample_fraction=100)
+    val_dataset = CombinedContrastiveDataset(val_data, mri_dict, negative_sample_fraction=100)
+    
+    print(f"Number of training combined samples: {len(train_dataset)}")
+    print(f"Number of validation combined samples: {len(val_dataset)}")
+    
+    train_loader = DataLoader(train_dataset, batch_size=3, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=3, shuffle=False)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    micro_dim = train_data.filter(like='Microbiome_').shape[1]
+    biom_dim = train_data.filter(like='Biomarker_').shape[1]
+    other_dim = train_data.filter(like='Other_').shape[1]
+    micro_encoder = MLPEncoder(micro_dim, 32).to(device)
+    biom_encoder = MLPEncoder(biom_dim, 32).to(device)
+    other_encoder = MLPEncoder(other_dim, 32).to(device)
+    mri_encoder = MRIClipEncoder(embed_dim=32, device=device).to(device)
+    
+    model_dict = {
+        "mri_encoder": mri_encoder,
+        "micro_encoder": micro_encoder,
+        "biom_encoder": biom_encoder,
+        "other_encoder": other_encoder
+    }
+    
+    params = list(mri_encoder.parameters()) + list(micro_encoder.parameters()) + \
+             list(biom_encoder.parameters()) + list(other_encoder.parameters())
+    optimizer = torch.optim.Adam(params, lr=0.01)
+    
+    train_metrics = []
+    val_metrics = []
+    epochs = 80
+    for epoch in range(1, epochs + 1):
+        (train_loss, train_rec, train_auc) = train_pretrain_epoch(model_dict, train_loader, optimizer, device=device)
+        (val_loss, val_rec, val_auc) = validate_pretrain_epoch(model_dict, val_loader, device=device)
+        
+        train_metrics.append((train_loss, train_rec, train_auc))
+        val_metrics.append((val_loss, val_rec, val_auc))
+        
+        print(f"Epoch {epoch}/{epochs} | "
+              f"Train Loss: {train_loss:.4f} Rec: {train_rec:.4f} AUC: {train_auc:.4f} | "
+              f"Val Loss: {val_loss:.4f} Rec: {val_rec:.4f} AUC: {val_auc:.4f}")
+    
+    # Save metric plots
+    plot_metrics(train_metrics, val_metrics, epochs)
+    
+    # EVALUATION
+    # For evaluation, restrict to positive samples from 4 patients.
+    eval_patient_ids = all_patients[:4]
+    print("Evaluation Patient IDs:", eval_patient_ids)
+    eval_data = data[data['Patient_ID'].isin(eval_patient_ids)]
+    eval_dataset = PositiveIndividualModalityDataset(eval_data, mri_dict)
+    eval_loader = DataLoader(eval_dataset, batch_size=1, shuffle=False, collate_fn=custom_collate_fn)
+    
+    print("\n===== EMBEDDING ANALYSIS (KNN, t-SNE, UMAP) ON POSITIVE SAMPLES =====")
+    class SelfSupervisedModel(nn.Module):
+        def __init__(self, mri_encoder, micro_encoder, biom_encoder, other_encoder):
+            super().__init__()
+            self.mri_encoder = mri_encoder
+            self.micro_encoder = micro_encoder
+            self.biom_encoder = biom_encoder
+            self.other_encoder = other_encoder
+        def forward(self, mri, micro, biom, other):
+            e_mri = self.mri_encoder(mri)
+            e_micro = self.micro_encoder(micro)
+            e_biom = self.biom_encoder(biom)
+            e_other = self.other_encoder(other)
+            return torch.cat([e_mri, e_micro, e_biom, e_other], dim=-1)
+    
+    model = SelfSupervisedModel(mri_encoder, micro_encoder, biom_encoder, other_encoder)
+    run_analysis_individual(model, eval_loader, device=device, k=1)
