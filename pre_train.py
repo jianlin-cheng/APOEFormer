@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -25,23 +26,24 @@ import torchvision.transforms as T
 ############################################################
 # 1) CSV Data Loading & Merging
 ############################################################
+def load_file(file_path):
+    try:
+        df = pd.read_csv(file_path)
+        df.rename(columns=lambda x: x.strip(), inplace=True)
+        # Drop APOE4 column if present.
+        if 'APOE4' in df.columns:
+            df.drop(columns=['APOE4'], inplace=True)
+        return df
+    except FileNotFoundError:
+        print(f"⚠️ File not found: {file_path}")
+        return pd.DataFrame()
+
 def load_data():
-    def load_file(file_path):
-        try:
-            df = pd.read_csv(file_path)
-            df.rename(columns=lambda x: x.strip(), inplace=True)
-            return df
-        except FileNotFoundError:
-            print(f"⚠️ File not found: {file_path}")
-            return pd.DataFrame()
-    
     microbiome = load_file('/home/tmnthc/New/Microbiome.csv')
     blood_metabolites = load_file('/home/tmnthc/New/Blood_Metabolites.csv')
     inflammatory_markers = load_file('/home/tmnthc/New/Sirolimus_inflammatory_markers.csv')
     blood_data = load_file('/home/tmnthc/New/Sirolimus_Blood_Data.csv')
     other_data = load_file('/home/tmnthc/New/Other.csv')
-    # Note: We no longer load brain_cbf_imaging CSV since we treat brain imaging via mri_dict.
-    # brain_cbf_imaging = load_file('/home/tmnthc/New/Brain_CBF_Imaging.csv')
     
     for name, df in zip(
         ["Microbiome", "Blood Metabolites", "Inflammatory Markers", "Blood Data", "Other"],
@@ -51,9 +53,6 @@ def load_data():
             print(f"⚠️ Warning: {name} data is empty or missing.")
         else:
             print(f"{name} data loaded with shape: {df.shape}")
-    
-    if 'APOE4' in other_data.columns:
-        other_data.drop(columns=['APOE4'], inplace=True)
     
     for df in [microbiome, blood_metabolites, inflammatory_markers, blood_data, other_data]:
         if 'Patient_ID' in df.columns:
@@ -80,13 +79,17 @@ def load_data():
         return df
     
     micro_num  = add_prefix(microbiome, "Microbiome")
-    blood_met  = add_prefix(blood_metabolites, "Biomarker")
-    inflam_num = add_prefix(inflammatory_markers, "Inflammatory")
+    blood_met_num  = add_prefix(blood_metabolites, "Biomarker")
     blood_data_num = add_prefix(blood_data, "Biomarker")
+    inflam_num = add_prefix(inflammatory_markers, "Biomarker")
+    
+    biomarker_data = blood_met_num.merge(blood_data_num, on=['Patient_ID', 'Timepoint'], how='outer')
+    biomarker_data = biomarker_data.merge(inflam_num, on=['Patient_ID', 'Timepoint'], how='outer')
+    
     other_num  = add_prefix(other_data, "Other")
-    # We no longer include CBF_ columns in the merge.
+    
     data = other_num.copy()
-    for df2 in [micro_num, blood_met, inflam_num, blood_data_num]:
+    for df2 in [micro_num, biomarker_data]:
         data = data.merge(df2, on=['Patient_ID','Timepoint'], how='outer')
     data.fillna(0, inplace=True)
     print(f"Final merged data shape: {data.shape}")
@@ -112,113 +115,134 @@ def load_mri_data(root_dir):
     return mri_dict
 
 ############################################################
-# Safe normalization function
+# Safe normalization and Augmentation Functions
 ############################################################
 def safe_normalize(x, p=2, dim=-1, eps=1e-12):
     norm = x.norm(p, dim=dim, keepdim=True)
     return x / (norm + eps)
 
+def advanced_image_augmentation():
+    return T.Compose([
+        T.RandomResizedCrop(128, scale=(0.8, 1.0)),
+        T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+        T.RandomRotation(15)
+    ])
+
+def advanced_numeric_augmentation(x, noise_std=0.05, scale_range=(0.9, 1.1)):
+    scale = torch.empty(1).uniform_(*scale_range).item()
+    noise = torch.randn_like(x) * noise_std
+    return x * scale + noise
+
 ############################################################
-# 4) MRIClipEncoder with Data Augmentation and Partial Fine-tuning
+# 4) MRIClipEncoder with Multi-Slice Aggregation
 ############################################################
 class MRIClipEncoder(nn.Module):
-    def __init__(self, embed_dim=32, augment=False):
+    def __init__(self, embed_dim=64, augment=False, dropout_p=0.0):
         super().__init__()
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        # Freeze all CLIP parameters...
+        # Freeze all layers initially, then unfreeze last 2 layers.
         for param in self.clip_model.parameters():
             param.requires_grad = False
-        # ...except for the last two layers of the vision encoder:
-        for param in self.clip_model.vision_model.encoder.layers[-2:].parameters():
-            param.requires_grad = True
-
-        self.processor  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        # Updated projection network with BatchNorm layers.
+        self._unfreeze_last_n_layers(2)
+        
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        # Use LayerNorm (instead of BatchNorm1d) and no dropout.
         self.project = nn.Sequential(
             nn.Linear(512, 64),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU(),
             nn.Linear(64, embed_dim),
-            nn.BatchNorm1d(embed_dim)
+            nn.LayerNorm(embed_dim)
         )
         self.augment = augment
         if self.augment:
-            self.augmentation = T.Compose([
-                T.RandomResizedCrop(128, scale=(0.8, 1.0)),
-                T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-                T.RandomHorizontalFlip()
-            ])
+            self.augmentation = advanced_image_augmentation()
+    
+    def _unfreeze_last_n_layers(self, n):
+        for layer in self.clip_model.vision_model.encoder.layers[-n:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+        print(f"Unfroze last {n} layers of CLIP vision encoder.")
     
     def forward(self, mri_batch):
+        """
+        For each MRI volume, extract three slices: center, one above, and one below.
+        Compute CLIP features for each slice, project them, and average the embeddings.
+        """
         device = mri_batch.device
         B = mri_batch.size(0)
-        pil_imgs = []
+        all_proj = []
         for i in range(B):
             vol = mri_batch[i, 0]
             if vol.ndim != 3:
                 vol = torch.zeros((128,128,128), dtype=torch.float32, device=device)
             D, H, W = vol.shape
-            idx = D // 2
-            slice_2d = vol[idx].cpu().numpy()
-            rng = slice_2d.max() - slice_2d.min()
-            slice_2d = (slice_2d - slice_2d.min()) / (rng + 1e-8)
-            slice_2d = (slice_2d * 255.0).astype(np.uint8)
-            if slice_2d.ndim != 2:
-                slice_2d = np.zeros((128,128), dtype=np.uint8)
-            pil_img = Image.fromarray(slice_2d, mode='L').convert("RGB")
-            if self.training and self.augment:
-                pil_img = self.augmentation(pil_img)
-            pil_imgs.append(pil_img)
-        
-        # Process all images together
-        inputs = self.processor(images=pil_imgs, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            clip_feats = self.clip_model.get_image_features(**inputs)
-        clip_feats = safe_normalize(clip_feats, p=2, dim=-1)
-        proj = self.project(clip_feats)
-        proj = safe_normalize(proj, p=2, dim=-1)
-        return proj
+            center = D // 2
+            idxs = [center]
+            if center - 1 >= 0:
+                idxs.append(center - 1)
+            if center + 1 < D:
+                idxs.append(center + 1)
+            slice_features = []
+            for idx in idxs:
+                slice_2d = vol[idx].cpu().numpy()
+                rng = slice_2d.max() - slice_2d.min()
+                slice_2d = (slice_2d - slice_2d.min()) / (rng + 1e-8)
+                slice_2d = (slice_2d * 255.0).astype(np.uint8)
+                if slice_2d.ndim != 2:
+                    slice_2d = np.zeros((128,128), dtype=np.uint8)
+                pil_img = Image.fromarray(slice_2d, mode='L').convert("RGB")
+                if self.training and self.augment:
+                    pil_img = self.augmentation(pil_img)
+                inputs = self.processor(images=pil_img, return_tensors="pt")
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    feat = self.clip_model.get_image_features(**inputs)
+                feat = safe_normalize(feat, p=2, dim=-1)
+                proj = self.project(feat)
+                proj = safe_normalize(proj, p=2, dim=-1)
+                slice_features.append(proj)
+            avg_proj = torch.mean(torch.cat(slice_features, dim=0), dim=0, keepdim=True)
+            all_proj.append(avg_proj)
+        return torch.cat(all_proj, dim=0)
 
 ############################################################
-# 5) MLPEncoder for numeric data with optional augmentation
+# 5) MLPEncoder for Numeric Data with Increased Capacity
 ############################################################
 class MLPEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim=16, augment=False):
+    def __init__(self, input_dim, output_dim=64, augment=False, dropout_p=0.0):
         super().__init__()
-        # Updated encoder with BatchNorm layers.
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim),
-            nn.BatchNorm1d(output_dim)
-        )
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.layernorm1 = nn.LayerNorm(256)
+        self.fc2 = nn.Linear(256, 256)
+        self.layernorm2 = nn.LayerNorm(256)
+        self.fc3 = nn.Linear(256, output_dim)
+        self.layernorm3 = nn.LayerNorm(output_dim)
+        self.dropout = nn.Dropout(dropout_p)
         self.augment = augment
     def forward(self, x):
-        x = self.encoder(x)
-        return safe_normalize(x, p=2, dim=-1)
+        out1 = self.layernorm1(self.fc1(x))
+        act1 = F.relu(out1)
+        act1 = self.dropout(act1)
+        out2 = self.layernorm2(self.fc2(act1))
+        act2 = F.relu(out2)
+        act2 = self.dropout(act2)
+        res = act1 + act2
+        out3 = self.layernorm3(self.fc3(res))
+        return safe_normalize(out3, p=2, dim=-1)
 
-
 ############################################################
-# 6) CombinedContrastiveDataset (now with 4 modalities)
+# 6) CombinedContrastiveDataset for 4 Modalities
 ############################################################
-############################################################
-# 6) CombinedContrastiveDataset (now with 4 modalities)
-############################################################
-# --- In CombinedContrastiveDataset, modify __getitem__ ---
 class CombinedContrastiveDataset(Dataset):
     def __init__(self, data, mri_dict, negative_sample_fraction=1, positive_repeat=10, augment=False):
         self.data = data.reset_index(drop=True)
         self.mri_dict = mri_dict
         self.N = len(self.data)
         self.augment = augment
-        
-        # Positive samples: repeat each sample "positive_repeat" times.
-        # Now each sample is represented as a tuple for 4 modalities.
-        self.positive_samples = [
-            (i, i, i, i) for i in range(self.N) for _ in range(positive_repeat)
-        ]
+        self.positive_samples = [(i, i, i, i) for i in range(self.N) for _ in range(positive_repeat)]
         num_negatives = int(self.N * negative_sample_fraction)
         negative_samples = []
         while len(negative_samples) < num_negatives:
@@ -235,100 +259,67 @@ class CombinedContrastiveDataset(Dataset):
     def __getitem__(self, idx):
         indices, label = self.samples[idx]
         i, j, k, l = indices
-        
-        # Get separate patient IDs and timepoints for each modality:
         pid_mri, tpt_mri = str(self.data.loc[i, "Patient_ID"]), str(self.data.loc[i, "Timepoint"])
         pid_micro, tpt_micro = str(self.data.loc[j, "Patient_ID"]), str(self.data.loc[j, "Timepoint"])
-        pid_biom,  tpt_biom  = str(self.data.loc[k, "Patient_ID"]), str(self.data.loc[k, "Timepoint"])
+        pid_biom, tpt_biom = str(self.data.loc[k, "Patient_ID"]), str(self.data.loc[k, "Timepoint"])
         pid_other, tpt_other = str(self.data.loc[l, "Patient_ID"]), str(self.data.loc[l, "Timepoint"])
         
-        # Retrieve MRI tensor using its own patient ID/timepoint.
         mri_tensor = self.mri_dict.get((pid_mri, tpt_mri), torch.zeros((1,128,128,128), dtype=torch.float32))
         micro_tensor = torch.tensor(self.data.filter(like="Microbiome_").iloc[j].values.astype(np.float32))
-        biom_tensor  = torch.tensor(self.data.filter(like="Biomarker_").iloc[k].values.astype(np.float32))
+        biom_tensor = torch.tensor(self.data.filter(like="Biomarker_").iloc[k].values.astype(np.float32))
         other_tensor = torch.tensor(self.data.filter(like="Other_").iloc[l].values.astype(np.float32))
         
         if self.augment and label == 1:
-            micro_tensor = augment_numeric(micro_tensor)
-            biom_tensor  = augment_numeric(biom_tensor)
-            other_tensor = augment_numeric(other_tensor)
+            micro_tensor = advanced_numeric_augmentation(micro_tensor)
+            biom_tensor = advanced_numeric_augmentation(biom_tensor)
+            other_tensor = advanced_numeric_augmentation(other_tensor)
         
-        # Pack the patient IDs from each modality into a tensor.
-        # (Assuming patient IDs can be converted to int; adjust if needed.)
-        patient_ids = torch.tensor(
-            [int(pid_mri), int(pid_micro), int(pid_biom), int(pid_other)],
-            dtype=torch.long
-        )
-        
+        patient_ids = torch.tensor([int(pid_mri), int(pid_micro), int(pid_biom), int(pid_other)], dtype=torch.long)
         return {
             "mri": mri_tensor,
             "micro": micro_tensor,
             "biom": biom_tensor,
             "other": other_tensor,
-            # Now patient_ids is a vector of length 4 for the 4 modalities.
             "patient_ids": patient_ids,
             "label": torch.tensor(label, dtype=torch.float32)
         }
 
-
 ############################################################
-# 8) Patient Contrastive Loss with Hard Negative Mining (4 modalities)
+# 8) Original Patient Contrastive Loss (unchanged)
 ############################################################
-def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, patient_ids, tau=0.05):
+def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, patient_ids, tau=0.03):
     B, D = e_mri.shape
-    # Create a 1D label vector matching the order of concatenated embeddings:
     labels = torch.cat([
-        patient_ids[:, 0],  # for MRI
-        patient_ids[:, 1],  # for Microbiome
-        patient_ids[:, 2],  # for Biomarker
-        patient_ids[:, 3]   # for Other
+        patient_ids[:, 0],
+        patient_ids[:, 1],
+        patient_ids[:, 2],
+        patient_ids[:, 3]
     ], dim=0)
-    
     emb_all = torch.cat([e_mri, e_micro, e_biom, e_other], dim=0)
     sim_matrix = torch.matmul(emb_all, emb_all.t()) / tau
     diag_mask = torch.eye(4 * B, dtype=torch.bool, device=sim_matrix.device)
     pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & (~diag_mask)
     neg_mask = ~pos_mask & (~diag_mask)
-    
-    # Use all negatives as is, without hard negative mining or margin subtraction.
     sim_pos = sim_matrix * pos_mask.float()
     sim_neg = sim_matrix * neg_mask.float()
-    
     eps = 1e-8
     sum_pos = torch.exp(sim_pos).sum(dim=1)
     sum_neg = torch.exp(sim_neg).sum(dim=1)
-    
     loss = -torch.log((sum_pos + eps) / (sum_pos + sum_neg + eps))
     return loss.mean()
 
-
-
 ############################################################
-# 9) MultiModalEmbeddingModel (4 modalities)
+# 10) Training & Validation with AdamW, Warmup + Cosine Annealing,
+# and Progressive Unfreezing of the CLIP Encoder.
 ############################################################
-class MultiModalEmbeddingModel(nn.Module):
-    def __init__(self, micro_dim, biom_dim, other_dim, embed_dim=16, augment=False):
-        super().__init__()
-        # Brain imaging modality from MRI images:
-        self.mri_encoder = MRIClipEncoder(embed_dim=embed_dim, augment=augment)
-        # Other numeric modalities:
-        self.micro_encoder = MLPEncoder(micro_dim, output_dim=embed_dim, augment=augment)
-        self.biom_encoder = MLPEncoder(biom_dim, output_dim=embed_dim, augment=augment)
-        self.other_encoder = MLPEncoder(other_dim, output_dim=embed_dim, augment=augment)
-    
-    def forward(self, mri, micro, biom, other):
-        e_mri = self.mri_encoder(mri)
-        e_micro = self.micro_encoder(micro)
-        e_biom = self.biom_encoder(biom)
-        e_other = self.other_encoder(other)
-        return e_mri, e_micro, e_biom, e_other
-
-############################################################
-# 10) Training & Validation
-############################################################
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, optimizer, device, current_epoch):
     model.train()
     total_loss = 0
+    # Progressive unfreezing: at epoch 30, unfreeze last 4 layers; at epoch 60, unfreeze all layers.
+    if current_epoch == 30:
+        model.mri_encoder._unfreeze_last_n_layers(4)
+    if current_epoch == 60:
+        model.mri_encoder._unfreeze_last_n_layers(12)  # assuming total 12 layers
     for batch in loader:
         mri = batch["mri"].to(device)
         micro = batch["micro"].to(device)
@@ -337,16 +328,12 @@ def train_epoch(model, loader, optimizer, device):
         pids = batch["patient_ids"].to(device)
         optimizer.zero_grad()
         e_mri, e_micro, e_biom, e_other = model(mri, micro, biom, other)
-        contrast_loss = patient_contrastive_loss(
-            e_mri, e_micro, e_biom, e_other,
-            patient_ids=pids, tau=0.05
-        )
-        contrast_loss.backward()
+        loss = patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, patient_ids=pids, tau=0.03)
+        loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        total_loss += contrast_loss.item()
+        total_loss += loss.item()
     return total_loss / len(loader)
-
 
 def validate_epoch(model, loader, device):
     model.eval()
@@ -359,18 +346,18 @@ def validate_epoch(model, loader, device):
             other = batch["other"].to(device)
             pids = batch["patient_ids"].to(device)
             e_mri, e_micro, e_biom, e_other = model(mri, micro, biom, other)
-            contrast_loss = patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, pids, tau=0.05)
-            total_loss += contrast_loss.item()
+            loss = patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, pids, tau=0.03)
+            total_loss += loss.item()
     return total_loss / len(loader)
 
 ############################################################
-# 11) Plotting Helpers
+# 11) Plotting Helpers & Embedding Analysis Functions
 ############################################################
 def plot_metrics(train_losses, val_losses, epochs):
-    e_range = range(1, epochs+1)
+    epochs_range = range(1, epochs + 1)
     plt.figure(figsize=(8,6))
-    plt.plot(e_range, train_losses, label='Train Loss')
-    plt.plot(e_range, val_losses, label='Val Loss')
+    plt.plot(epochs_range, train_losses, label='Training Loss')
+    plt.plot(epochs_range, val_losses, label='Validation Loss')
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training & Validation Loss")
@@ -380,9 +367,6 @@ def plot_metrics(train_losses, val_losses, epochs):
     plt.close()
     print("Saved loss.png")
 
-############################################################
-# 12) Embedding Analysis Helpers (KNN, t-SNE, UMAP)
-############################################################
 def knn_accuracy(embs, labels, k=1):
     knn = KNeighborsClassifier(n_neighbors=k, metric='cosine')
     knn.fit(embs, labels)
@@ -390,7 +374,7 @@ def knn_accuracy(embs, labels, k=1):
     return (preds == labels).mean()
 
 def tsne_visualization(embeds, group_labels, full_labels, title='t-SNE'):
-    tsne = TSNE(n_components=2, perplexity=20, learning_rate=500, n_iter=1500, random_state=42)
+    tsne = TSNE(n_components=2, perplexity=30, learning_rate=200, n_iter=1500, random_state=42)
     e2d = tsne.fit_transform(embeds)
     unique_groups = np.unique(group_labels)
     cmap = plt.get_cmap('tab10', len(unique_groups))
@@ -418,7 +402,7 @@ def tsne_visualization(embeds, group_labels, full_labels, title='t-SNE'):
     print("Saved tsne_plot.png")
 
 def umap_visualization(embeds, group_labels, full_labels, title='UMAP'):
-    reducer = umap.UMAP(n_components=2, n_neighbors=10, min_dist=0.05, random_state=42)
+    reducer = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.01, random_state=42)
     e2d = reducer.fit_transform(embeds)
     unique_groups = np.unique(group_labels)
     cmap = plt.get_cmap('tab10', len(unique_groups))
@@ -445,13 +429,26 @@ def umap_visualization(embeds, group_labels, full_labels, title='UMAP'):
     plt.close()
     print("Saved umap_plot.png")
 
-def augment_numeric(x, noise_std=0.05):
-    noise = torch.randn_like(x) * noise_std
-    return x + noise
-
+############################################################
+# 9) MultiModalEmbeddingModel combining all encoders
+############################################################
+class MultiModalEmbeddingModel(nn.Module):
+    def __init__(self, micro_dim, biom_dim, other_dim, embed_dim=64, augment=False):
+        super().__init__()
+        self.mri_encoder = MRIClipEncoder(embed_dim=embed_dim, augment=augment)
+        self.micro_encoder = MLPEncoder(micro_dim, output_dim=embed_dim, augment=augment)
+        self.biom_encoder = MLPEncoder(biom_dim, output_dim=embed_dim, augment=augment)
+        self.other_encoder = MLPEncoder(other_dim, output_dim=embed_dim, augment=augment)
+    
+    def forward(self, mri, micro, biom, other):
+        e_mri = self.mri_encoder(mri)
+        e_micro = self.micro_encoder(micro)
+        e_biom = self.biom_encoder(biom)
+        e_other = self.other_encoder(other)
+        return e_mri, e_micro, e_biom, e_other
 
 ############################################################
-# 13) Main
+# 13) Main function
 ############################################################
 def main():
     data = load_data()
@@ -461,8 +458,9 @@ def main():
     if len(all_pats) < 19:
         raise ValueError("Need at least 19 patients for this example.")
     
-    train_pats = all_pats[:16]
-    val_pats = all_pats[16:19]
+    selected_pats = np.random.choice(all_pats, size=19, replace=False)
+    train_pats = selected_pats[:16]
+    val_pats = selected_pats[16:]
     
     print("Training Patient IDs:", train_pats)
     print("Validation Patient IDs:", val_pats)
@@ -470,64 +468,62 @@ def main():
     train_data = data[data["Patient_ID"].isin(train_pats)]
     val_data = data[data["Patient_ID"].isin(val_pats)]
     
-    train_data = train_data.sort_values(["Patient_ID","Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
-    val_data   = val_data.sort_values(["Patient_ID","Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
+    train_data = train_data.sort_values(["Patient_ID", "Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
+    val_data = val_data.sort_values(["Patient_ID", "Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
     
     print(f"Training data rows: {len(train_data)}")
     print(f"Validation data rows: {len(val_data)}")
     
-    # Use balanced sampling with positive_repeat=10 and enable augmentation for training.
     train_set = CombinedContrastiveDataset(train_data, mri_dict, negative_sample_fraction=8, positive_repeat=2, augment=True)
-    # For validation, disable augmentation.
     val_set = CombinedContrastiveDataset(val_data, mri_dict, negative_sample_fraction=8, positive_repeat=2, augment=False)
     
     print(f"Number of training combined samples: {len(train_set)}")
     print(f"Number of validation combined samples: {len(val_set)}")
     
-    # Increase batch size to 128 for more in-batch negatives.
     train_loader = DataLoader(train_set, batch_size=128, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=128, shuffle=False)
     
     micro_dim = train_data.filter(like='Microbiome_').shape[1]
-    biom_dim  = train_data.filter(like='Biomarker_').shape[1]
+    biom_dim = train_data.filter(like='Biomarker_').shape[1]
     other_dim = train_data.filter(like='Other_').shape[1]
     print(f"Micro={micro_dim}, Biom={biom_dim}, Other={other_dim}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Build model with augmentation enabled for training.
-    model = MultiModalEmbeddingModel(micro_dim, biom_dim, other_dim, embed_dim=16, augment=True).to(device)
+    model = MultiModalEmbeddingModel(micro_dim, biom_dim, other_dim, embed_dim=64, augment=True).to(device)
     
-    # Adjust optimizer: use a higher LR for the unfrozen CLIP vision layers.
-    optimizer = torch.optim.Adam([
-        {'params': model.mri_encoder.clip_model.vision_model.encoder.layers[-2:].parameters(), 'lr': 1e-4},
+    optimizer = torch.optim.AdamW([
+        {'params': model.mri_encoder.clip_model.vision_model.encoder.parameters(), 'lr': 1e-4},
         {'params': model.mri_encoder.project.parameters(), 'lr': 5e-3},
-        {'params': model.micro_encoder.parameters(), 'lr': 5e-3},
-        {'params': model.biom_encoder.parameters(), 'lr': 5e-3},
-        {'params': model.other_encoder.parameters(), 'lr': 5e-3},
-    ], weight_decay=1e-5)
-
+        {'params': model.micro_encoder.parameters(), 'lr': 1e-3},
+        {'params': model.biom_encoder.parameters(), 'lr': 1e-3},
+        {'params': model.other_encoder.parameters(), 'lr': 1e-3},
+    ], weight_decay=1e-6)
     
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    total_epochs = 120
+    warmup_epochs = 10
+    def lr_lambda(current_epoch):
+        if current_epoch < warmup_epochs:
+            return float(current_epoch + 1) / warmup_epochs
+        else:
+            return 0.5 * (1 + math.cos(math.pi * (current_epoch - warmup_epochs) / (total_epochs - warmup_epochs)))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     
-    # Increase epochs from 150 to 200
-    epochs = 200
     train_losses = []
     val_losses = []
-    
-    for ep in range(1, epochs+1):
-        tr_loss = train_epoch(model, train_loader, optimizer, device)
+    for ep in range(1, total_epochs + 1):
+        tr_loss = train_epoch(model, train_loader, optimizer, device, current_epoch=ep)
         val_loss = validate_epoch(model, val_loader, device)
         scheduler.step()
-        print(f"Epoch {ep}/{epochs} | Train Loss: {tr_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"Epoch {ep}/{total_epochs} | Train Loss: {tr_loss:.4f} | Val Loss: {val_loss:.4f}")
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
     
-    plot_metrics(train_losses, val_losses, epochs)
+    plot_metrics(train_losses, val_losses, total_epochs)
     torch.save(model.state_dict(), "model_checkpoint.pth")
     print("Checkpoint saved as model_checkpoint.pth")
     
-    # (Embedding analysis code remains unchanged)
+    # Embedding Analysis
     class PositiveModalityDataset(Dataset):
         def __init__(self, data, mri_dict):
             self.data = data.reset_index(drop=True)
