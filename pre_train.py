@@ -141,7 +141,7 @@ def advanced_numeric_augmentation(x, noise_std=0.05, scale_range=(0.9, 1.1)):
 # 4) MRIClipEncoder with Multi-Slice Aggregation (LayerNorm, no dropout)
 ############################################################
 class MRIClipEncoder(nn.Module):
-    def __init__(self, embed_dim=64, augment=False, dropout_p=0.0):
+    def __init__(self, embed_dim=64, augment=False, dropout_p=0.1):
         super().__init__()
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         for param in self.clip_model.parameters():
@@ -208,7 +208,7 @@ class MRIClipEncoder(nn.Module):
 # 5) MLPEncoder for Numeric Data with Increased Capacity (LayerNorm, no dropout)
 ############################################################
 class MLPEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim=64, augment=False, dropout_p=0.0):
+    def __init__(self, input_dim, output_dim=64, augment=False, dropout_p=0.1):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, 256)
         self.layernorm1 = nn.LayerNorm(256)
@@ -578,6 +578,10 @@ def main():
         if len(label) > 0:
             test_embeddings.append(emb)
             test_labels.append(label[0])
+    
+    knn_acc = knn_accuracy(np.array(train_val_embeddings), np.array(train_val_labels), k=1)
+    print(f"KNN Accuracy on train+val embeddings: {knn_acc*100:.2f}%")
+
     
     clf = LogisticRegression(max_iter=1000)
     clf.fit(train_val_embeddings, train_val_labels)
