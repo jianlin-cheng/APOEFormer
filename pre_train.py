@@ -579,7 +579,7 @@ def main():
             test_embeddings.append(emb)
             test_labels.append(label[0])
     
-    knn_acc = knn_accuracy(np.array(train_val_embeddings), np.array(train_val_labels), k=1)
+    knn_acc = knn_accuracy(np.array(train_val_embeddings), np.array(train_val_labels), k=2)
     print(f"KNN Accuracy on train+val embeddings: {knn_acc*100:.2f}%")
 
     
