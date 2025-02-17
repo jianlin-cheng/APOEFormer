@@ -1,12 +1,25 @@
+import random
+import numpy as np
+import torch
+
+# Set random seed for reproducibility
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+    
+# For more reproducible results (may impact performance)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 import os
 import math
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import random
 
 import nibabel as nib
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -411,82 +424,7 @@ class AttentionClassifier(nn.Module):
         return logits.squeeze(-1)                          # [B]
 
 ###########################################
-# Custom Dataset for Attention Classification
-###########################################
-class AttentionDataset(Dataset):
-    def __init__(self, patient_ids, data, mri_dict, model, device):
-        """
-        For each patient in patient_ids, we select one sample (first available)
-        and compute the four modality embeddings using the pretrained model.
-        """
-        self.samples = []
-        self.device = device
-        self.model = model
-        for pid in patient_ids:
-            patient_data = data[data["Patient_ID"] == pid]
-            if len(patient_data) == 0:
-                continue
-            row = patient_data.iloc[0]
-            mri_tensor = mri_dict.get((str(row["Patient_ID"]), str(row["Timepoint"])),
-                                      torch.zeros((1,128,128,128), dtype=torch.float32))
-            micro_tensor = torch.tensor(row.filter(like="Microbiome_").values.astype(np.float32))
-            biom_tensor = torch.tensor(row.filter(like="Biomarker_").values.astype(np.float32))
-            other_tensor = torch.tensor(row.filter(like="Other_").values.astype(np.float32))
-            mri_tensor = mri_tensor.to(device).unsqueeze(0)
-            micro_tensor = micro_tensor.to(device).unsqueeze(0)
-            biom_tensor = biom_tensor.to(device).unsqueeze(0)
-            other_tensor = other_tensor.to(device).unsqueeze(0)
-            with torch.no_grad():
-                e_mri, e_micro, e_biom, e_other = model(mri_tensor, micro_tensor, biom_tensor, other_tensor)
-            # Stack embeddings to shape [4, embed_dim]
-            embeddings = torch.stack([e_mri.squeeze(0), e_micro.squeeze(0), e_biom.squeeze(0), e_other.squeeze(0)], dim=0)
-            self.samples.append( (embeddings, pid) )
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-# Collate function for AttentionDataset (batching embeddings and patient IDs)
-def attn_collate(batch):
-    embeddings_list, pid_list = zip(*batch)
-    # Stack embeddings to form a batch of shape [B, 4, embed_dim]
-    embeddings = torch.stack(embeddings_list, dim=0)
-    return embeddings, pid_list
-
-###########################################
-# Training & Validation for Attention Classifier
-###########################################
-def train_attn_epoch(attn_classifier, dataloader, optimizer, criterion, device):
-    attn_classifier.train()
-    total_loss = 0.0
-    for embeddings, _ in dataloader:
-        embeddings = embeddings.to(device)  # [B, 4, embed_dim]
-        # Labels will be provided later in the dataset mapping (we attach them externally)
-        # For now, assume that we have a dictionary mapping patient IDs to labels.
-        # We'll actually add the labels below.
-        # In our case, we'll pass the labels as part of a tuple: (embeddings, label)
-        # So this function expects that labels are already in the batch.
-        # For our implementation, we modify our dataset to include labels.
-        # (See below for the updated AttentionDatasetWithLabels.)
-        # This function is not used directly.
-        pass
-
-def validate_attn_epoch(attn_classifier, dataloader, criterion, device):
-    attn_classifier.eval()
-    total_loss = 0.0
-    with torch.no_grad():
-        for embeddings, labels in dataloader:
-            embeddings = embeddings.to(device)
-            labels = labels.to(device).float()
-            logits = attn_classifier(embeddings)
-            loss = criterion(logits, labels)
-            total_loss += loss.item() * embeddings.size(0)
-    return total_loss / len(dataloader.dataset)
-
-###########################################
-# We'll update the AttentionDataset to include labels.
+# Custom Dataset for Attention Classification with Labels
 ###########################################
 class AttentionDatasetWithLabels(Dataset):
     def __init__(self, patient_ids, data, mri_dict, model, device, patient_labels):
@@ -581,7 +519,7 @@ def main():
         {'params': model.other_encoder.parameters(), 'lr': 1e-3},
     ], weight_decay=1e-6)
     
-    total_epochs = 120
+    total_epochs = 100
     warmup_epochs = 10
     def lr_lambda(current_epoch):
         if current_epoch < warmup_epochs:
@@ -613,7 +551,7 @@ def main():
     patient_labels_df = other_df.groupby("Patient_ID")["APOE4"].max().reset_index()
     patient_apoe4 = {row["Patient_ID"]: int(row["APOE4"]) for _, row in patient_labels_df.iterrows()}
     
-    # For attention classifier, we now use the same training and validation patients as pretraining.
+    # For attention classifier, we use the same training and validation patients as pretraining.
     # The remaining patients will be used as the test set.
     train_attn_dataset = AttentionDatasetWithLabels(train_pats, data, mri_dict, model, device, patient_apoe4)
     val_attn_dataset = AttentionDatasetWithLabels(val_pats, data, mri_dict, model, device, patient_apoe4)
@@ -630,7 +568,7 @@ def main():
     attn_optimizer = torch.optim.Adam(attn_classifier.parameters(), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
     
-    num_attn_epochs = 120
+    num_attn_epochs = 50
     attn_train_losses = []
     attn_val_losses = []
     for epoch in range(num_attn_epochs):
