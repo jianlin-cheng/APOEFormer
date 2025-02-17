@@ -25,9 +25,26 @@ from sklearn.metrics import accuracy_score
 
 import torchvision.transforms as T
 
-############################################################
+###########################################
+# Helper: Plot Loss Metrics
+###########################################
+def plot_metrics(train_losses, val_losses, total_epochs):
+    epochs = range(1, total_epochs+1)
+    plt.figure(figsize=(8,6))
+    plt.plot(epochs, train_losses, label="Train Loss", marker='o')
+    plt.plot(epochs, val_losses, label="Val Loss", marker='o')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss_plot.png", dpi=300)
+    plt.close()
+    print("Saved loss plot as loss_plot.png")
+
+###########################################
 # 1) CSV Data Loading & Merging
-############################################################
+###########################################
 def load_file(file_path, drop_apoe4=True):
     try:
         df = pd.read_csv(file_path)
@@ -40,12 +57,12 @@ def load_file(file_path, drop_apoe4=True):
         return pd.DataFrame()
 
 def load_data():
-    microbiome = load_file('/home/tmnthc/New/Microbiome.csv')
-    blood_metabolites = load_file('/home/tmnthc/New/Blood_Metabolites.csv')
-    inflammatory_markers = load_file('/home/tmnthc/New/Sirolimus_inflammatory_markers.csv')
-    blood_data = load_file('/home/tmnthc/New/Sirolimus_Blood_Data.csv')
+    microbiome = load_file('/home/tmnthc/New1/Microbiome.csv')
+    blood_metabolites = load_file('/home/tmnthc/New1/Blood_Metabolites.csv')
+    inflammatory_markers = load_file('/home/tmnthc/New1/Sirolimus_inflammatory_markers.csv')
+    blood_data = load_file('/home/tmnthc/New1/Sirolimus_Blood_Data.csv')
     # For pretraining, drop APOE4
-    other_data = load_file('/home/tmnthc/New/Other.csv', drop_apoe4=True)
+    other_data = load_file('/home/tmnthc/New1/Other.csv', drop_apoe4=True)
 
     for name, df in zip(
         ["Microbiome", "Blood Metabolites", "Inflammatory Markers", "Blood Data", "Other"],
@@ -97,9 +114,9 @@ def load_data():
     print(f"Final merged data shape: {data.shape}")
     return data
 
-############################################################
+###########################################
 # 2) MRI Data Loading (for brain imaging)
-############################################################
+###########################################
 def load_mri_data(root_dir):
     mri_dict = {}
     for patient_id in os.listdir(root_dir):
@@ -116,9 +133,9 @@ def load_mri_data(root_dir):
                     mri_dict[(patient_id, timepoint_name)] = mri_tensor
     return mri_dict
 
-############################################################
+###########################################
 # Safe normalization and Augmentation Functions
-############################################################
+###########################################
 def safe_normalize(x, p=2, dim=-1, eps=1e-12):
     norm = x.norm(p, dim=dim, keepdim=True)
     return x / (norm + eps)
@@ -132,14 +149,13 @@ def advanced_image_augmentation():
         T.RandomRotation(15)
     ])
 
-def advanced_numeric_augmentation(x, noise_std=0.05, scale_range=(0.9, 1.1)):
-    scale = torch.empty(1).uniform_(*scale_range).item()
+def augment_numeric(x, noise_std=0.05):
     noise = torch.randn_like(x) * noise_std
-    return x * scale + noise
+    return x + noise
 
-############################################################
+###########################################
 # 4) MRIClipEncoder with Multi-Slice Aggregation (LayerNorm, no dropout)
-############################################################
+###########################################
 class MRIClipEncoder(nn.Module):
     def __init__(self, embed_dim=64, augment=False, dropout_p=0.1):
         super().__init__()
@@ -204,9 +220,9 @@ class MRIClipEncoder(nn.Module):
             all_proj.append(avg_proj)
         return torch.cat(all_proj, dim=0)
 
-############################################################
+###########################################
 # 5) MLPEncoder for Numeric Data with Increased Capacity (LayerNorm, no dropout)
-############################################################
+###########################################
 class MLPEncoder(nn.Module):
     def __init__(self, input_dim, output_dim=64, augment=False, dropout_p=0.1):
         super().__init__()
@@ -229,9 +245,9 @@ class MLPEncoder(nn.Module):
         out3 = self.layernorm3(self.fc3(res))
         return safe_normalize(out3, p=2, dim=-1)
 
-############################################################
+###########################################
 # 6) CombinedContrastiveDataset for 4 Modalities
-############################################################
+###########################################
 class CombinedContrastiveDataset(Dataset):
     def __init__(self, data, mri_dict, negative_sample_fraction=1, positive_repeat=10, augment=False):
         self.data = data.reset_index(drop=True)
@@ -266,9 +282,9 @@ class CombinedContrastiveDataset(Dataset):
         other_tensor = torch.tensor(self.data.filter(like="Other_").iloc[l].values.astype(np.float32))
         
         if self.augment and label == 1:
-            micro_tensor = advanced_numeric_augmentation(micro_tensor)
-            biom_tensor = advanced_numeric_augmentation(biom_tensor)
-            other_tensor = advanced_numeric_augmentation(other_tensor)
+            micro_tensor = augment_numeric(micro_tensor)
+            biom_tensor = augment_numeric(biom_tensor)
+            other_tensor = augment_numeric(other_tensor)
         
         sample_label = f"{pid_mri}_{tpt_mri}"
         return {
@@ -280,21 +296,23 @@ class CombinedContrastiveDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.float32)
         }
 
-############################################################
-# Custom collate function to gather sample_label as a list
-############################################################
+###########################################
+# Custom collate function
+###########################################
 def custom_collate(batch):
     collated = {}
     for key in batch[0]:
         if key == "sample_label":
             collated[key] = [d[key] for d in batch]
+        elif key == "label":
+            collated[key] = torch.stack([d[key] for d in batch])
         else:
             collated[key] = torch.stack([d[key] for d in batch])
     return collated
 
-############################################################
-# 8) Patient Contrastive Loss Using Sample Labels (NT-Xent style)
-############################################################
+###########################################
+# 8) Patient Contrastive Loss (NT-Xent style)
+###########################################
 def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, sample_labels, tau=0.5):
     B, D = e_mri.shape
     all_labels = sample_labels + sample_labels + sample_labels + sample_labels
@@ -314,10 +332,9 @@ def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, sample_labels, tau
     loss = -torch.log((sum_pos + eps) / (sum_pos + sum_neg + eps))
     return loss.mean()
 
-############################################################
-# 10) Training & Validation with AdamW, Warmup + Cosine Annealing,
-# and Progressive Unfreezing of the CLIP Encoder.
-############################################################
+###########################################
+# 10) Training & Validation
+###########################################
 def train_epoch(model, loader, optimizer, device, current_epoch):
     model.train()
     total_loss = 0
@@ -355,96 +372,16 @@ def validate_epoch(model, loader, device):
             total_loss += loss.item()
     return total_loss / len(loader)
 
-############################################################
-# 11) Plotting Helpers & Embedding Analysis Functions
-############################################################
-def plot_metrics(train_losses, val_losses, epochs):
-    epochs_range = range(1, epochs + 1)
-    plt.figure(figsize=(8,6))
-    plt.plot(epochs_range, train_losses, label='Training Loss')
-    plt.plot(epochs_range, val_losses, label='Validation Loss')
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Training & Validation Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("loss.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print("Saved loss.png")
-
-def knn_accuracy(embs, labels, k=1):
-    knn = KNeighborsClassifier(n_neighbors=k, metric='cosine')
-    knn.fit(embs, labels)
-    preds = knn.predict(embs)
-    return (preds == labels).mean()
-
-def tsne_visualization(embeds, group_labels, full_labels, title='t-SNE'):
-    tsne = TSNE(n_components=2, perplexity=30, learning_rate=200, n_iter=1500, random_state=42)
-    e2d = tsne.fit_transform(embeds)
-    unique_groups = np.unique(group_labels)
-    cmap = plt.get_cmap('tab10', len(unique_groups))
-    group_color = {g: cmap(i) for i, g in enumerate(unique_groups)}
-    marker_dict = {"mri": "o", "micro": "s", "biom": "D", "other": "^"}
-    plt.figure(figsize=(10,8))
-    plotted = {}
-    for i, (x, y) in enumerate(e2d):
-        group = group_labels[i]
-        mod = full_labels[i].split('_')[-1].lower()
-        marker = marker_dict.get(mod, 'o')
-        legend_label = f"{group}_{mod}"
-        if legend_label not in plotted:
-            plt.scatter(x, y, c=group_color[group], marker=marker, s=80, label=legend_label)
-            plotted[legend_label] = True
-        else:
-            plt.scatter(x, y, c=group_color[group], marker=marker, s=80)
-    plt.title(title)
-    plt.xlabel("t-SNE dim1")
-    plt.ylabel("t-SNE dim2")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig("tsne_plot.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print("Saved tsne_plot.png")
-
-def umap_visualization(embeds, group_labels, full_labels, title='UMAP'):
-    reducer = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.01, random_state=42)
-    e2d = reducer.fit_transform(embeds)
-    unique_groups = np.unique(group_labels)
-    cmap = plt.get_cmap('tab10', len(unique_groups))
-    group_color = {g: cmap(i) for i, g in enumerate(unique_groups)}
-    marker_dict = {"mri": "o", "micro": "s", "biom": "D", "other": "^"}
-    plt.figure(figsize=(10,8))
-    plotted = {}
-    for i, (x, y) in enumerate(e2d):
-        group = group_labels[i]
-        mod = full_labels[i].split('_')[-1].lower()
-        marker = marker_dict.get(mod, 'o')
-        legend_label = f"{group}_{mod}"
-        if legend_label not in plotted:
-            plt.scatter(x, y, c=group_color[group], marker=marker, s=80, label=legend_label)
-            plotted[legend_label] = True
-        else:
-            plt.scatter(x, y, c=group_color[group], marker=marker, s=80)
-    plt.title(title)
-    plt.xlabel("UMAP dim1")
-    plt.ylabel("UMAP dim2")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig("umap_plot.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    print("Saved umap_plot.png")
-
-############################################################
-# 9) MultiModalEmbeddingModel combining all encoders
-############################################################
+###########################################
+# 11) MultiModalEmbeddingModel
+###########################################
 class MultiModalEmbeddingModel(nn.Module):
     def __init__(self, micro_dim, biom_dim, other_dim, embed_dim=64, augment=False):
         super().__init__()
         self.mri_encoder = MRIClipEncoder(embed_dim=embed_dim, augment=augment)
-        self.micro_encoder = MLPEncoder(micro_dim, output_dim=embed_dim, augment=augment)
-        self.biom_encoder = MLPEncoder(biom_dim, output_dim=embed_dim, augment=augment)
-        self.other_encoder = MLPEncoder(other_dim, output_dim=embed_dim, augment=augment)
-    
+        self.micro_encoder = MLPEncoder(input_dim=micro_dim, output_dim=embed_dim, augment=augment)
+        self.biom_encoder = MLPEncoder(input_dim=biom_dim, output_dim=embed_dim, augment=augment)
+        self.other_encoder = MLPEncoder(input_dim=other_dim, output_dim=embed_dim, augment=augment)
     def forward(self, mri, micro, biom, other):
         e_mri = self.mri_encoder(mri)
         e_micro = self.micro_encoder(micro)
@@ -452,9 +389,83 @@ class MultiModalEmbeddingModel(nn.Module):
         e_other = self.other_encoder(other)
         return e_mri, e_micro, e_biom, e_other
 
-############################################################
-# 13) Main function: Pretraining and then downstream classification
-############################################################
+###########################################
+# 12) Embedding Analysis Helpers
+###########################################
+def knn_accuracy(embeddings, labels, k=1):
+    knn = KNeighborsClassifier(n_neighbors=k, metric='cosine')
+    knn.fit(embeddings, labels)
+    preds = knn.predict(embeddings)
+    return (preds == labels).mean()
+
+def tsne_visualization(embeddings, group_labels, full_labels, title="t-SNE Visualization"):
+    n_samples = embeddings.shape[0]
+    perplexity = min(20, n_samples - 1) if n_samples > 1 else 1
+    print(f"Using perplexity: {perplexity} for {n_samples} samples in TSNE.")
+    tsne = TSNE(n_components=2, perplexity=perplexity, learning_rate=500, max_iter=1500, random_state=42)
+    tsne_embeddings = tsne.fit_transform(embeddings)
+
+    unique_groups = np.unique(group_labels)
+    cmap = plt.get_cmap('tab10', len(unique_groups))
+    group_color = {group: cmap(i) for i, group in enumerate(unique_groups)}
+
+    marker_dict = {"mri": "o", "micro": "s", "biom": "D", "other": "^", "cbf": "v"}
+    plt.figure(figsize=(10,8))
+    plotted = {}
+    for i, (x, y) in enumerate(tsne_embeddings):
+        group = group_labels[i]
+        modality = group.split('_')[-1].lower()
+        marker = marker_dict.get(modality, 'o')
+        legend_label = group
+        if legend_label not in plotted:
+            plt.scatter(x, y, color=group_color[group], marker=marker, s=80, label=legend_label)
+            plotted[legend_label] = True
+        else:
+            plt.scatter(x, y, color=group_color[group], marker=marker, s=80)
+    plt.title(title)
+    plt.xlabel("t-SNE Dim 1")
+    plt.ylabel("t-SNE Dim 2")
+    plt.legend(bbox_to_anchor=(1.05,1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(f"{title.replace(' ', '_').lower()}.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved t-SNE plot as {title.replace(' ', '_').lower()}.png")
+
+def umap_visualization(embeddings, group_labels, full_labels, title="UMAP Visualization"):
+    n_samples = embeddings.shape[0]
+    n_neighbors = min(10, n_samples - 1) if n_samples > 1 else 1
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.05, random_state=42)
+    umap_embeddings = reducer.fit_transform(embeddings)
+
+    unique_groups = np.unique(group_labels)
+    cmap = plt.get_cmap('tab10', len(unique_groups))
+    group_color = {group: cmap(i) for i, group in enumerate(unique_groups)}
+
+    marker_dict = {"mri": "o", "micro": "s", "biom": "D", "other": "^", "cbf": "v"}
+    plt.figure(figsize=(10,8))
+    plotted = {}
+    for i, (x, y) in enumerate(umap_embeddings):
+        group = group_labels[i]
+        modality = group.split('_')[-1].lower()
+        marker = marker_dict.get(modality, 'o')
+        legend_label = group
+        if legend_label not in plotted:
+            plt.scatter(x, y, color=group_color[group], marker=marker, s=80, label=legend_label)
+            plotted[legend_label] = True
+        else:
+            plt.scatter(x, y, color=group_color[group], marker=marker, s=80)
+    plt.title(title)
+    plt.xlabel("UMAP Dim 1")
+    plt.ylabel("UMAP Dim 2")
+    plt.legend(bbox_to_anchor=(1.05,1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(f"{title.replace(' ', '_').lower()}.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved UMAP plot as {title.replace(' ', '_').lower()}.png")
+
+###########################################
+# 13) Main function: Pretraining, Downstream Classification, and Visualization
+###########################################
 def main():
     # Pretraining Phase
     data = load_data()
@@ -480,8 +491,8 @@ def main():
     print(f"Training data rows: {len(train_data)}")
     print(f"Validation data rows: {len(val_data)}")
     
-    train_set = CombinedContrastiveDataset(train_data, mri_dict, negative_sample_fraction=8, positive_repeat=2, augment=True)
-    val_set = CombinedContrastiveDataset(val_data, mri_dict, negative_sample_fraction=8, positive_repeat=2, augment=False)
+    train_set = CombinedContrastiveDataset(train_data, mri_dict, negative_sample_fraction=6, positive_repeat=2, augment=True)
+    val_set = CombinedContrastiveDataset(val_data, mri_dict, negative_sample_fraction=6, positive_repeat=2, augment=False)
     
     train_loader = DataLoader(train_set, batch_size=128, shuffle=True, collate_fn=custom_collate)
     val_loader = DataLoader(val_set, batch_size=128, shuffle=False, collate_fn=custom_collate)
@@ -527,7 +538,7 @@ def main():
     print("Checkpoint saved as model_checkpoint.pth")
     
     # Downstream Classification for APOE4:
-    other_df = pd.read_csv('/home/tmnthc/New/Other.csv')
+    other_df = pd.read_csv('/home/tmnthc/New1/Other.csv')
     other_df.rename(columns=lambda x: x.strip(), inplace=True)
     other_df['Patient_ID'] = other_df['Patient_ID'].astype(str).str.strip()
     other_df['Timepoint'] = other_df['Timepoint'].astype(str).str.strip()
@@ -579,9 +590,8 @@ def main():
             test_embeddings.append(emb)
             test_labels.append(label[0])
     
-    knn_acc = knn_accuracy(np.array(train_val_embeddings), np.array(train_val_labels), k=2)
-    print(f"KNN Accuracy on train+val embeddings: {knn_acc*100:.2f}%")
-
+    fusion_knn_acc = knn_accuracy(np.array(train_val_embeddings), np.array(train_val_labels), k=2)
+    print(f"KNN Accuracy on train+val fusion embeddings: {fusion_knn_acc*100:.2f}%")
     
     clf = LogisticRegression(max_iter=1000)
     clf.fit(train_val_embeddings, train_val_labels)
@@ -589,16 +599,55 @@ def main():
     test_acc = accuracy_score(test_labels, preds)
     print(f"Downstream APOE4 classification accuracy on test set: {test_acc*100:.2f}%")
     
-    all_embs = np.array(train_val_embeddings)
-    scaler_emb = StandardScaler()
-    all_embs = scaler_emb.fit_transform(all_embs)
-    if all_embs.shape[0] > 50:
-        pca = PCA(n_components=50, whiten=True)
-        all_embs = pca.fit_transform(all_embs)
-    all_embs = all_embs / (np.linalg.norm(all_embs, axis=1, keepdims=True) + 1e-8)
-    group_labels = list(train_val_ids)
-    tsne_visualization(all_embs, group_labels, group_labels, title="t-SNE of Train+Val Patients")
-    umap_visualization(all_embs, group_labels, group_labels, title="UMAP of Train+Val Patients")
+    ##########################################################
+    # Visualization on Positive Validation Samples (Combined Modalities):
+    ##########################################################
+    positive_indices = [i for i in range(len(val_set)) if val_set[i]['label'].item() == 1]
+    positive_val_set = torch.utils.data.Subset(val_set, positive_indices)
+    positive_val_loader = DataLoader(positive_val_set, batch_size=32, shuffle=False, collate_fn=custom_collate)
+    
+    # (Already computed TSNE/UMAP on positive samples in your earlier section...)
+    # Now, additionally compute TSNE/UMAP for the entire validation set.
+    
+    ##########################################################
+    # Visualization on Entire Validation Set:
+    ##########################################################
+    val_loader_all = DataLoader(val_set, batch_size=32, shuffle=False, collate_fn=custom_collate)
+    mri_embeddings_list_all = []
+    micro_embeddings_list_all = []
+    biom_embeddings_list_all = []
+    other_embeddings_list_all = []
+    all_sample_labels = []
+    with torch.no_grad():
+        for batch in val_loader_all:
+            mri = batch["mri"].to(device)
+            micro = batch["micro"].to(device)
+            biom = batch["biom"].to(device)
+            other = batch["other"].to(device)
+            sample_labels_batch = batch["sample_label"]
+            e_mri, e_micro, e_biom, e_other = model(mri, micro, biom, other)
+            mri_embeddings_list_all.append(e_mri.cpu().numpy())
+            micro_embeddings_list_all.append(e_micro.cpu().numpy())
+            biom_embeddings_list_all.append(e_biom.cpu().numpy())
+            other_embeddings_list_all.append(e_other.cpu().numpy())
+            all_sample_labels.extend(sample_labels_batch)
+    mri_embeddings_all = np.concatenate(mri_embeddings_list_all, axis=0)
+    micro_embeddings_all = np.concatenate(micro_embeddings_list_all, axis=0)
+    biom_embeddings_all = np.concatenate(biom_embeddings_list_all, axis=0)
+    other_embeddings_all = np.concatenate(other_embeddings_list_all, axis=0)
+    
+    combined_embeddings_all = np.concatenate([mri_embeddings_all, micro_embeddings_all,
+                                               biom_embeddings_all, other_embeddings_all], axis=0)
+    combined_group_labels_all = ([f"{lab}_mri" for lab in all_sample_labels] +
+                                 [f"{lab}_micro" for lab in all_sample_labels] +
+                                 [f"{lab}_biom" for lab in all_sample_labels] +
+                                 [f"{lab}_other" for lab in all_sample_labels])
+    combined_full_labels_all = combined_group_labels_all.copy()
+    
+    tsne_visualization(combined_embeddings_all, combined_group_labels_all, combined_full_labels_all,
+                       title="t-SNE on Entire Validation Modalities Embeddings")
+    umap_visualization(combined_embeddings_all, combined_group_labels_all, combined_full_labels_all,
+                       title="UMAP on Entire Validation Modalities Embeddings")
 
 if __name__ == "__main__":
     main()
