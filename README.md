@@ -23,9 +23,9 @@ This repository demonstrates a two-stage approach for combining **MRI** data wit
   - If too many values are missing, we drop that column or those rows entirely to avoid introducing too many artificial values.
 - **Z-score Normalization:**
   - After handling missing data, we compute the mean and standard deviation for each numeric feature and apply:
-    \[
-    X_{\mathrm{norm}} \=\ \frac{X - \mu}{\sigma}.
-    \]
+    
+    X_norm = (X - μ) / σ
+    
   - This ensures features have mean 0 and standard deviation 1, which often stabilizes MLP training.
 - For **pretraining**, we drop the APOE4 column to avoid label leakage. For **classification**, we reintroduce the APOE4 labels from *Other.csv* or a similar file.
 
