@@ -96,26 +96,8 @@ This repository demonstrates a two-stage approach for combining **MRI** data wit
 
 ---
 
-## 7. Handling Missing Values
 
-- **Group/Average Imputation:**  
-  If only a small fraction of a column is missing, we fill with the mean (or group mean).
-- **Dropping Data:**  
-  If a feature or row is largely missing, we may drop it entirely.
-
----
-
-## 8. Z-score Normalization
-
-Once missing values are handled, each numeric feature \(X\) is standardized:
-\[
-X_{\mathrm{norm}} = \frac{X - \mu}{\sigma},
-\]
-ensuring mean 0 and standard deviation 1. This helps the MLP handle numeric data more consistently.
-
----
-
-## 9. Step-by-Step Training Procedure
+## 7. Step-by-Step Training Procedure
 
 1. **Preprocess the CSVs:**
    - Fix missing data (imputation or dropping).
@@ -131,7 +113,7 @@ ensuring mean 0 and standard deviation 1. This helps the MLP handle numeric data
 
 ---
 
-## 10. Running the Code
+## 8. Running the Code
 
 - **Dependencies:**  
   - `pytorch`, `torchvision`, `transformers` (for CLIP), `nibabel` (for NIfTI), `pandas`, `numpy`, etc.
@@ -150,7 +132,7 @@ Printing final test accuracy.
 
 ---
 
-## 11. Conclusion
+## 9. Conclusion
 This pipeline covers:
 * Missing values (imputation or dropping).
 * Z-score normalization of numeric features.
