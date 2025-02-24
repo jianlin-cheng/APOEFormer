@@ -150,7 +150,7 @@ Printing final test accuracy.
 
 ---
 
-11. Conclusion
+## 11. Conclusion
 This pipeline covers:
 * Missing values (imputation or dropping).
 * Z-score normalization of numeric features.
