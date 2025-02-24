@@ -147,3 +147,20 @@ This pipeline covers:
 - Slicing 3D MRI volumes for CLIP-based feature extraction.
 - Contrastive pretraining to align MRI + numeric features.
 - Attention classification (optionally across multiple timepoints).
+
+---
+## 10. Embedding analysis for pretraining (Optional)
+
+- **Dimensionality Reduction:**
+  - Uses **t-SNE** for visualization.
+  - Helps in understanding how well MRI and numeric features align in the learned embedding space.
+
+- **Embedding Evaluation:**
+  - Evaluates embeddings using **KNN**.
+  - Measures classification accuracy to assess the quality of the learned representations.
+
+- **Command:**
+
+  ```bash
+  python3 pre_train_and_embedding.py
+  ```
