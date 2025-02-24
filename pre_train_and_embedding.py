@@ -537,18 +537,6 @@ def main():
     torch.save(model.state_dict(), "model_checkpoint.pth")
     print("Checkpoint saved as model_checkpoint.pth")
     
-    # Downstream Classification for APOE4:
-    other_df = pd.read_csv('/home/tmnthc/New1/Other.csv')
-    other_df.rename(columns=lambda x: x.strip(), inplace=True)
-    other_df['Patient_ID'] = other_df['Patient_ID'].astype(str).str.strip()
-    other_df['Timepoint'] = other_df['Timepoint'].astype(str).str.strip()
-    patient_labels = other_df.groupby("Patient_ID")["APOE4"].max().reset_index()
-    
-    train_val_ids = set(train_pats.tolist() + val_pats.tolist())
-    all_patient_ids = set(other_df["Patient_ID"].unique())
-    test_ids = list(all_patient_ids - train_val_ids)
-    print("Downstream classification: Test patient IDs:", test_ids)
-    
     def get_patient_embedding(patient_id, data, model, device):
         patient_data = data[data["Patient_ID"] == patient_id]
         embeddings = []
