@@ -139,17 +139,7 @@ This script handles:
 
 ---
 
-## 9. Conclusion
-
-This pipeline covers:
-- Missing values (imputation or dropping).
-- Z-score normalization of numeric features.
-- Slicing 3D MRI volumes for CLIP-based feature extraction.
-- Contrastive pretraining to align MRI + numeric features.
-- Attention classification (optionally across multiple timepoints).
-
----
-## 10. Embedding analysis for pretraining (Optional)
+## 9. Embedding analysis for pretraining (Optional)
 
 - **Dimensionality Reduction:**
   - Uses **t-SNE** for visualization.
