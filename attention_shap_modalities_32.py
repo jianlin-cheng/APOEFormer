@@ -4,7 +4,7 @@ import random
 import numpy as np
 import torch
 
-# Set random seed for reproducibility
+# Set random seeds for reproducibility
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
@@ -18,20 +18,15 @@ import os
 import math
 import pandas as pd
 import matplotlib.pyplot as plt
-
 import nibabel as nib
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
 from PIL import Image, ImageDraw
 from transformers import CLIPProcessor, CLIPModel
-
 import torchvision.transforms as T
 import cv2  # for resizing heatmaps
-
-# Import SHAP
-import shap
+import shap  # SHAP
 
 ###########################################
 # Helper: Plot Loss Metrics
@@ -140,17 +135,12 @@ def load_mri_data(root_dir):
                     timepoint_name = tfile.split('.')[0]
                     full_path = os.path.join(patient_path, tfile)
                     mri_image = nib.load(full_path).get_fdata()
-                    
-                    # If the data is 4D with a singleton 4th dimension, squeeze it out.
-                    if mri_image.ndim == 4 and mri_image.shape[3] == 1:
-                        mri_image = mri_image[:,:,:,0]
-                    
-                    # Now assume the image is 3D with shape (H, W, slices) – e.g., (128, 128, 32).
-                    # We want to rearrange it to (slices, H, W).
-                    if mri_image.ndim == 3:
-                        mri_image = np.transpose(mri_image, (2, 0, 1))
-                    # Normalization: subtract the mean and divide by the standard deviation.
-                    # Make sure the standard deviation is not zero.
+                    # Do not average slices—if image is 4D with extra singleton dimension, squeeze it.
+                    if len(mri_image.shape) == 4 and mri_image.shape[-1] == 1:
+                        mri_image = np.squeeze(mri_image, axis=-1)
+                    # Convert to torch tensor and add batch dimension.
+
+                      # Normalization: subtract the mean and divide by the standard deviation.
                     mean_val = np.mean(mri_image)
                     std_val = np.std(mri_image)
                     if std_val != 0:
@@ -158,7 +148,6 @@ def load_mri_data(root_dir):
                     else:
                         mri_image = mri_image - mean_val
                         
-                    # Convert numpy array to a tensor [1, slices, H, W]
                     mri_tensor = torch.tensor(mri_image, dtype=torch.float32).unsqueeze(0)
                     mri_dict[(patient_id, timepoint_name)] = mri_tensor
     return mri_dict
@@ -184,7 +173,7 @@ def augment_numeric(x, noise_std=0.05):
     return x + noise
 
 ###########################################
-# 4) MRIClipEncoder with Multi-Slice Aggregation
+# 3) MRIClipEncoder
 ###########################################
 class MRIClipEncoder(nn.Module):
     def __init__(self, embed_dim=64, augment=False, dropout_p=0.1):
@@ -218,24 +207,27 @@ class MRIClipEncoder(nn.Module):
             self._unfreeze_last_n_layers(self.unfreeze_layers)
 
     def forward(self, mri_batch):
+        """
+        Expects mri_batch of shape (B, 1, H, W, D).
+        Processes each slice individually with CLIP's vision encoder, 
+        returning a (B, D, embed_dim) embedding.
+        """
         device = mri_batch.device
         B = mri_batch.size(0)
         all_proj = []
         for i in range(B):
             vol = mri_batch[i, 0]
-            # Ensure the volume is 3D; if not, create a default volume with shape (128,128,32)
             if vol.ndim != 3:
-                vol = torch.zeros((128, 128, 32), dtype=torch.float32, device=device)
-            D, H, W = vol.shape  # Expected: D=32, H=128, W=128
-            idxs = list(range(D))  # Process all slices
+                vol = torch.zeros((128, 128, 128), dtype=torch.float32, device=device)
+            D, H, W = vol.shape
             slice_features = []
-            for idx in idxs:
+            for idx in range(D):
                 slice_2d = vol[idx].cpu().numpy()
                 rng = slice_2d.max() - slice_2d.min()
                 slice_2d = (slice_2d - slice_2d.min()) / (rng + 1e-8)
                 slice_2d = (slice_2d * 255.0).astype(np.uint8)
                 if slice_2d.ndim != 2:
-                    slice_2d = np.zeros((128, 128), dtype=np.uint8)
+                    slice_2d = np.zeros((H, W), dtype=np.uint8)
                 pil_img = Image.fromarray(slice_2d, mode='L').convert("RGB")
                 if self.training and self.augment:
                     pil_img = self.augmentation(pil_img)
@@ -246,15 +238,13 @@ class MRIClipEncoder(nn.Module):
                 feat = safe_normalize(feat, p=2, dim=-1)
                 proj = self.project(feat)
                 proj = safe_normalize(proj, p=2, dim=-1)
-                slice_features.append(proj)  # Each proj has shape (1, embed_dim)
-            # Concatenate slice embeddings; resulting shape will be (D, embed_dim)
+                slice_features.append(proj)
             volume_embeddings = torch.cat(slice_features, dim=0)
-            all_proj.append(volume_embeddings)
-        # Stack each volume's embeddings; final output shape: (B, D, embed_dim)
-        return torch.stack(all_proj, dim=0)
+            all_proj.append(volume_embeddings.unsqueeze(0))  # shape (1, D, embed_dim)
+        return torch.cat(all_proj, dim=0)  # shape (B, D, embed_dim)
 
 ###########################################
-# 5) MLPEncoder for Numeric Data
+# 4) MLPEncoder for Numeric Data
 ###########################################
 class MLPEncoder(nn.Module):
     def __init__(self, input_dim, output_dim=64, augment=False, dropout_p=0.1):
@@ -280,7 +270,7 @@ class MLPEncoder(nn.Module):
         return safe_normalize(out3, p=2, dim=-1)
 
 ###########################################
-# 6) CombinedContrastiveDataset
+# 5) CombinedContrastiveDataset
 ###########################################
 class CombinedContrastiveDataset(Dataset):
     def __init__(self, data, mri_dict, negative_sample_fraction=1, positive_repeat=10, augment=False):
@@ -288,8 +278,11 @@ class CombinedContrastiveDataset(Dataset):
         self.mri_dict = mri_dict
         self.N = len(self.data)
         self.augment = augment
-        # Positive samples
-        self.positive_samples = [(i, i, i, i, i) for i in range(self.N) for _ in range(positive_repeat)]
+        # Create positive pairs (same sample repeated)
+        self.positive_samples = [
+            (i, i, i, i, i) for i in range(self.N) for _ in range(positive_repeat)
+        ]
+        # Create negative pairs (random mismatch)
         num_negatives = int(self.N * negative_sample_fraction)
         negative_samples = []
         while len(negative_samples) < num_negatives:
@@ -297,6 +290,8 @@ class CombinedContrastiveDataset(Dataset):
             if len(set(sample)) > 1:
                 negative_samples.append(tuple(sample))
         self.negative_samples = negative_samples
+
+        # Label=1 for positives, label=0 for negatives
         self.samples = [(s, 1) for s in self.positive_samples] + [(s, 0) for s in self.negative_samples]
         print(f"Total combined samples: {len(self.samples)}")
 
@@ -306,6 +301,7 @@ class CombinedContrastiveDataset(Dataset):
     def __getitem__(self, idx):
         indices, label = self.samples[idx]
         i, j, k, l, m = indices
+
         pid_mri, tpt_mri = str(self.data.loc[i, "Patient_ID"]), str(self.data.loc[i, "Timepoint"])
         pid_micro, tpt_micro = str(self.data.loc[j, "Patient_ID"]), str(self.data.loc[j, "Timepoint"])
         pid_biom, tpt_biom = str(self.data.loc[k, "Patient_ID"]), str(self.data.loc[k, "Timepoint"])
@@ -335,9 +331,6 @@ class CombinedContrastiveDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.float32)
         }
 
-###########################################
-# Custom collate for CombinedContrastiveDataset
-###########################################
 def custom_collate(batch):
     collated = {}
     for key in batch[0]:
@@ -349,28 +342,16 @@ def custom_collate(batch):
             collated[key] = torch.stack([d[key] for d in batch])
     return collated
 
-import skimage.segmentation as seg
-
-def custom_segmentation(image):
-    """
-    Segment the image into smaller regions using quickshift.
-    Adjust parameters to get finer segments.
-    
-    Args:
-        image (np.ndarray): Image array of shape (H, W, C).
-    Returns:
-        segments (np.ndarray): Array of segment labels.
-    """
-    # Use quickshift with a small kernel size and low max_dist for smaller segments.
-    segments = seg.quickshift(image, kernel_size=4, max_dist=6, ratio=0.5)
-    return segments
-
 ###########################################
-# 8) Patient Contrastive Loss
+# 6) Patient Contrastive Loss
 ###########################################
 def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, e_numeric, sample_labels, tau=0.5):
+    """
+    e_mri, e_micro, e_biom, e_other, e_numeric: (B, embed_dim)
+    We combine them into a big matrix of shape (5*B, embed_dim).
+    Then do typical contrastive cross-entropy.
+    """
     B, D = e_mri.shape
-    # Repeat sample_labels 5 times
     all_labels = sample_labels * 5
     unique_labels, inverse = np.unique(all_labels, return_inverse=True)
     labels = torch.tensor(inverse, device=e_mri.device)
@@ -388,7 +369,27 @@ def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, e_numeric, sample_
     return loss.mean()
 
 ###########################################
-# 10) Training & Validation for Pretraining
+# 7) MultiModalEmbeddingModel
+###########################################
+class MultiModalEmbeddingModel(nn.Module):
+    def __init__(self, micro_dim, biom_dim, other_dim, numeric_dim, embed_dim=64, augment=False):
+        super().__init__()
+        self.mri_encoder = MRIClipEncoder(embed_dim=embed_dim, augment=augment)
+        self.micro_encoder = MLPEncoder(input_dim=micro_dim, output_dim=embed_dim, augment=augment)
+        self.biom_encoder = MLPEncoder(input_dim=biom_dim, output_dim=embed_dim, augment=augment)
+        self.other_encoder = MLPEncoder(input_dim=other_dim, output_dim=embed_dim, augment=augment)
+        self.numeric_encoder = MLPEncoder(input_dim=numeric_dim, output_dim=embed_dim, augment=augment)
+
+    def forward(self, mri, micro, biom, other):
+        e_mri = self.mri_encoder(mri)   # (B, D, embed_dim)
+        # For non-MRI, we just do MLP on entire vector → (B, embed_dim)
+        e_micro = self.micro_encoder(micro)
+        e_biom  = self.biom_encoder(biom)
+        e_other = self.other_encoder(other)
+        return e_mri, e_micro, e_biom, e_other
+
+###########################################
+# 8) Training & Validation for Pretraining
 ###########################################
 def train_epoch(model, loader, optimizer, device, epoch, val_loss_history, patience_threshold=5):
     model.train()
@@ -401,16 +402,26 @@ def train_epoch(model, loader, optimizer, device, epoch, val_loss_history, patie
         mri_numeric = batch["mri_numeric"].to(device)
         sample_labels = batch["sample_label"]
         optimizer.zero_grad()
+        # Forward
         e_mri, e_micro, e_biom, e_other = model(mri, micro, biom, other)
         e_numeric = model.numeric_encoder(mri_numeric)
-        loss = patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, e_numeric, sample_labels=sample_labels, tau=0.5)
+        # We average over the slices for e_mri to get shape (B, embed_dim)
+        # or we can also keep it separate, but let's do a simple mean here for contrastive:
+        e_mri_mean = e_mri.mean(dim=1)
+        loss = patient_contrastive_loss(e_mri_mean, e_micro, e_biom, e_other, e_numeric,
+                                        sample_labels=sample_labels, tau=0.5)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         total_loss += loss.item()
     avg_loss = total_loss / len(loader)
+
+    # This is where we can gradually unfreeze more CLIP layers if val loss is not improving
     if len(val_loss_history) > 0 and avg_loss >= max(val_loss_history[-patience_threshold:]):
-        model.mri_encoder.gradually_unfreeze(current_patience=patience_threshold, max_patience=patience_threshold)
+        model.mri_encoder.gradually_unfreeze(
+            current_patience=patience_threshold,
+            max_patience=patience_threshold
+        )
     return avg_loss
 
 def validate_epoch(model, loader, device):
@@ -426,30 +437,15 @@ def validate_epoch(model, loader, device):
             sample_labels = batch["sample_label"]
             e_mri, e_micro, e_biom, e_other = model(mri, micro, biom, other)
             e_numeric = model.numeric_encoder(mri_numeric)
-            loss = patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, e_numeric, sample_labels=sample_labels, tau=0.5)
+            # Mean over slices for MRI
+            e_mri_mean = e_mri.mean(dim=1)
+            loss = patient_contrastive_loss(e_mri_mean, e_micro, e_biom, e_other, e_numeric,
+                                            sample_labels=sample_labels, tau=0.5)
             total_loss += loss.item()
     return total_loss / len(loader)
 
 ###########################################
-# 11) MultiModalEmbeddingModel
-###########################################
-class MultiModalEmbeddingModel(nn.Module):
-    def __init__(self, micro_dim, biom_dim, other_dim, numeric_dim, embed_dim=64, augment=False):
-        super().__init__()
-        self.mri_encoder = MRIClipEncoder(embed_dim=embed_dim, augment=augment)
-        self.micro_encoder = MLPEncoder(input_dim=micro_dim, output_dim=embed_dim, augment=augment)
-        self.biom_encoder = MLPEncoder(input_dim=biom_dim, output_dim=embed_dim, augment=augment)
-        self.other_encoder = MLPEncoder(input_dim=other_dim, output_dim=embed_dim, augment=augment)
-        self.numeric_encoder = MLPEncoder(input_dim=numeric_dim, output_dim=embed_dim, augment=augment)
-    def forward(self, mri, micro, biom, other):
-        e_mri = self.mri_encoder(mri)
-        e_micro = self.micro_encoder(micro)
-        e_biom = self.biom_encoder(biom)
-        e_other = self.other_encoder(other)
-        return e_mri, e_micro, e_biom, e_other
-
-###########################################
-# NEW: Stacked Multi-Head Attention Classifier
+# 9) Stacked Multi-Head Attention Classifier
 ###########################################
 class StackedAttentionClassifier(nn.Module):
     def __init__(self, embed_dim=64, num_heads=4, num_layers=2, dropout=0.1):
@@ -459,23 +455,34 @@ class StackedAttentionClassifier(nn.Module):
             self.layers.append(nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True))
         self.dropout = nn.Dropout(dropout)
         self.layernorm = nn.LayerNorm(embed_dim)
-        self.fuse = nn.Linear(embed_dim * 2, embed_dim)
+        self.fuse = nn.Linear(embed_dim*2, embed_dim)
         self.classifier = nn.Linear(embed_dim, 1)
+
     def forward(self, embeddings):
+        """
+        embeddings: (B, T, embed_dim)
+        returns: (B, T) with a logit per token
+        """
         residual = embeddings
         out = embeddings
         for layer in self.layers:
             attn_output, _ = layer(out, out, out)
             out = self.layernorm(out + self.dropout(attn_output))
-        fused = torch.cat([residual.mean(dim=1), out.mean(dim=1)], dim=1)
-        fused = F.relu(self.fuse(fused))
-        logits = self.classifier(fused)
-        return logits.squeeze(-1)
+        fused = torch.cat([residual, out], dim=-1)  # shape (B, T, 2*embed_dim)
+        fused = F.relu(self.fuse(fused))            # shape (B, T, embed_dim)
+        logits = self.classifier(fused)             # shape (B, T, 1)
+        return logits.squeeze(-1)                   # shape (B, T)
 
 ###########################################
-# Custom Dataset for Attention Classification
+# 10) Dataset for Attention Classification
 ###########################################
 class AttentionDatasetWithLabels(Dataset):
+    """
+    Creates a (T, embed_dim) embedding for each patient, 
+    where T = 5 * (# MRI slices).
+    Order of stacked embeddings: [MRI_slices, Micro_repeated, Biom_repeated, Other_repeated, Numeric_repeated]
+    Then flatten to shape (T, embed_dim).
+    """
     def __init__(self, patient_ids, data, mri_dict, model, device, patient_labels):
         self.samples = []
         self.device = device
@@ -488,42 +495,39 @@ class AttentionDatasetWithLabels(Dataset):
             mri_tensor = mri_dict.get((str(row["Patient_ID"]), str(row["Timepoint"])),
                                       torch.zeros((1,128,128,32), dtype=torch.float32))
             micro_tensor = torch.tensor(row.filter(like="Microbiome_").values.astype(np.float32))
-            biom_tensor = torch.tensor(row.filter(like="Biomarker_").values.astype(np.float32))
+            biom_tensor  = torch.tensor(row.filter(like="Biomarker_").values.astype(np.float32))
             other_tensor = torch.tensor(row.filter(like="Other_").values.astype(np.float32))
             mri_numeric_tensor = torch.tensor(row.filter(like="mri_numeric_").values.astype(np.float32))
     
-            mri_tensor = mri_tensor.to(device).unsqueeze(0)  # shape: (1, 1, 128, 128, 32)
-            micro_tensor = micro_tensor.to(device).unsqueeze(0)  # shape: (1, embed_dim)
+            # Move to device and encode
+            mri_tensor = mri_tensor.to(device).unsqueeze(0)  # (1, 1, H, W, D)
+            micro_tensor = micro_tensor.to(device).unsqueeze(0)
             biom_tensor = biom_tensor.to(device).unsqueeze(0)
             other_tensor = other_tensor.to(device).unsqueeze(0)
             mri_numeric_tensor = mri_numeric_tensor.to(device).unsqueeze(0)
     
             with torch.no_grad():
                 e_mri, e_micro, e_biom, e_other = model(mri_tensor, micro_tensor, biom_tensor, other_tensor)
-                e_numeric = model.numeric_encoder(mri_numeric_tensor)
+                # e_mri: (1, D, 64)
+                e_numeric = model.numeric_encoder(mri_numeric_tensor)  # (1, 64)
     
-            # e_mri is now of shape (1, 32, embed_dim) from using all slices.
-            e_mri = e_mri.squeeze(0)  # becomes (32, embed_dim)
-            rep = e_mri.size(0)      # rep = 32
+            e_mri = e_mri.squeeze(0)  # shape (D, 64)
+            rep = e_mri.size(0)       # number of slices
+
+            # Repeat each of the other embeddings D times so shapes match
+            e_micro = e_micro.squeeze(0).unsqueeze(0).repeat(rep, 1)    # (D, 64)
+            e_biom  = e_biom.squeeze(0).unsqueeze(0).repeat(rep, 1)     # (D, 64)
+            e_other = e_other.squeeze(0).unsqueeze(0).repeat(rep, 1)    # (D, 64)
+            e_numeric = e_numeric.squeeze(0).unsqueeze(0).repeat(rep, 1)# (D, 64)
     
-            # For the other modalities, replicate their single-token embedding 32 times.
-            e_micro = e_micro.squeeze(0).unsqueeze(0).repeat(rep, 1)   # (32, embed_dim)
-            e_biom  = e_biom.squeeze(0).unsqueeze(0).repeat(rep, 1)    # (32, embed_dim)
-            e_other = e_other.squeeze(0).unsqueeze(0).repeat(rep, 1)   # (32, embed_dim)
-            e_numeric = e_numeric.squeeze(0).unsqueeze(0).repeat(rep, 1)  # (32, embed_dim)
-    
-            # Stack all modality embeddings along a new dimension.
-            # This creates a tensor of shape (5, 32, embed_dim)
+            # Stack them: shape (5, D, 64)
             modalities = torch.stack([e_mri, e_micro, e_biom, e_other, e_numeric], dim=0)
-            # Flatten the first two dimensions to create a single sequence.
-            # The resulting shape will be (5*32, embed_dim) i.e. (160, embed_dim)
+            # Flatten first 2 dims -> (5*D, 64)
             sample_embedding = modalities.view(-1, modalities.size(-1))
     
             label = patient_labels.get(str(pid), 0)
             self.samples.append((sample_embedding, torch.tensor(label, dtype=torch.float32)))
 
-
-    
     def __len__(self):
         return len(self.samples)
     
@@ -532,218 +536,12 @@ class AttentionDatasetWithLabels(Dataset):
 
 def attn_collate_with_labels(batch):
     embeddings_list, label_list = zip(*batch)
-    embeddings = torch.stack(embeddings_list, dim=0)  # [B, 5, embed_dim]
-    labels = torch.stack(label_list, dim=0)           # [B]
+    embeddings = torch.stack(embeddings_list, dim=0)  # (B, 5*D, 64)
+    labels = torch.stack(label_list, dim=0)           # (B,)
     return embeddings, labels
 
 ###########################################
-# Updated: Factory to create model_image_wrapper
-###########################################
-def model_image_wrapper_factory(model):
-    """Returns a closure that references model in scope."""
-    import numpy as np
-    from PIL import Image
-
-    def model_image_wrapper(x):
-        """
-        Args:
-            x (numpy.ndarray): shape (B, H, W, C) with B = batch size.
-
-        Returns:
-            np.ndarray: shape (B,) containing one scalar output per image
-        """
-        device = next(model.mri_encoder.parameters()).device
-        outputs = []
-
-        for i in range(x.shape[0]):
-            img = x[i]  # shape (H, W, C)
-            # If single channel, replicate to RGB
-            if img.shape[-1] == 1:
-                img = np.repeat(img, 3, axis=-1)
-
-            pil_img = Image.fromarray(img.astype(np.uint8), mode='RGB')
-            inputs = model.mri_encoder.processor(images=pil_img, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                feat = model.mri_encoder.clip_model.get_image_features(**inputs)
-                feat = safe_normalize(feat, p=2, dim=-1)
-                proj = model.mri_encoder.project(feat)
-                proj = safe_normalize(proj, p=2, dim=-1)
-
-            # Use the mean of the embedding as a single scalar output
-            outputs.append(proj.mean().item())
-
-        return np.array(outputs)
-
-    return model_image_wrapper
-
-###########################################
-# Updated: compute_shap_for_sample using shap.Explainer
-###########################################
-def compute_shap_for_sample(model, mri_dict, first_pid, first_timepoint):
-    import shap
-    import numpy as np
-    from PIL import Image
-    import matplotlib.pyplot as plt
-
-    adjusted_pid = first_pid.zfill(3)
-    sample_key = (adjusted_pid, f"{adjusted_pid}_Baseline")
-    print(f"Looking for sample key: {sample_key}")
-    
-    sample_volume = mri_dict.get(sample_key)
-    if sample_volume is None:
-        print("Sample MRI not found for SHAP explanation.")
-        return
-    volume_np = sample_volume.cpu().numpy()[0]  # shape (D, H, W)
-    center = volume_np.shape[0] // 2
-    central_slice = volume_np[center]          # shape (H, W)
-
-    rng = central_slice.max() - central_slice.min()
-    if rng > 0:
-        norm_slice = (central_slice - central_slice.min()) / (rng + 1e-8)
-    else:
-        norm_slice = central_slice
-    norm_slice = (norm_slice * 255).astype(np.uint8)
-
-    pil_img = Image.fromarray(norm_slice, mode='L').convert('RGB')
-    np_img_ex = np.array(pil_img)  # shape (H, W, 3)
-
-    input_for_shap = np_img_ex[np.newaxis, ...]  # shape (1, H, W, 3)
-    # (background_data is defined but not used by the new explainer API)
-    
-    # Create the masker (without a custom segmentation function here)
-    masker = shap.maskers.Image(
-        mask_value="inpaint_telea",
-        shape=np_img_ex.shape
-    )
-
-    wrapper_func = model_image_wrapper_factory(model)
-    explainer = shap.Explainer(wrapper_func, masker=masker)
-    explanation = explainer(input_for_shap, max_evals=100)
-
-        # For shap>=0.39, generate the plot without showing it
-    shap.plots.image(explanation, show=False)
-    fig = plt.gcf()  # get the current figure
-    fig.savefig("shap_pretraining.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print("SHAP explanation saved as shap_pretraining.png for MRI image (pretraining branch).")
-
-
-
-def attn_model_wrapper_factory(model, attn_model):
-    """
-    Returns a wrapper function that computes the attention classifier's output
-    from a raw MRI image input.
-    
-    The function expects a numpy array x of shape (B, H, W, 3) (i.e. RGB images)
-    and for each image it:
-      1. Processes it through the MRI branch (CLIP + projection) to obtain an embedding.
-      2. Replicates that embedding to mimic a fused input (e.g. 5 modalities).
-      3. Feeds the fused embedding to the attention classifier.
-    
-    This allows the SHAP explanation to be computed for the attention classifier using
-    an MRI image input, making its visualization similar (in terms of image content) to the 
-    pretraining branch.
-    """
-    import torch
-    from PIL import Image
-
-    device = next(model.mri_encoder.parameters()).device
-
-    def wrapper(x):
-        outputs = []
-        for i in range(x.shape[0]):
-            # Process raw MRI image input
-            img = x[i]  # shape (H, W, 3)
-            pil_img = Image.fromarray(img.astype(np.uint8), mode='RGB')
-            inputs = model.mri_encoder.processor(images=pil_img, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                # Compute the MRI embedding using the CLIP branch
-                feat = model.mri_encoder.clip_model.get_image_features(**inputs)
-                feat = safe_normalize(feat, p=2, dim=-1)
-                proj = model.mri_encoder.project(feat)
-                proj = safe_normalize(proj, p=2, dim=-1)
-            # Create a fused embedding for the attention classifier.
-            # Here we replicate the MRI embedding 5 times (one per modality)
-            fused_embedding = proj.repeat(5, 1)  # shape (5, embed_dim)
-            fused_embedding = fused_embedding.unsqueeze(0)  # shape (1, 5, embed_dim)
-            with torch.no_grad():
-                out = attn_model(fused_embedding)
-            outputs.append(out.item())
-        return np.array(outputs)
-    return wrapper
-
-def compute_shap_for_attention(attn_model, model, mri_dict, pid, timepoint):
-    """
-    Compute SHAP values for the attention classifier using a raw MRI image input.
-    
-    Unlike the previous attention SHAP (which operated on a fused embedding),
-    this function uses a new wrapper (attn_model_wrapper_factory) that routes the raw MRI
-    slice through the MRI branch and then through the attention classifier.
-    
-    The resulting SHAP explanation (saved as "shap_attention.png") reflects the attention
-    classifier's own output while using an image input similar to the one used for pretraining.
-    
-    Args:
-        attn_model: The attention classifier instance.
-        model: The multi-modal model (with the MRI encoder).
-        mri_dict: Dictionary mapping (Patient_ID, Timepoint) to MRI tensors.
-        pid (str): Patient ID.
-        timepoint (str): Timepoint.
-    """
-    import shap
-    import numpy as np
-    from PIL import Image
-    import matplotlib.pyplot as plt
-
-    # Process the patient identifier (adjust padding if needed)
-    adjusted_pid = pid.zfill(3)
-    sample_key = (adjusted_pid, f"{adjusted_pid}_Baseline")
-    print(f"Looking for sample key: {sample_key}")
-
-    sample_volume = mri_dict.get(sample_key)
-    if sample_volume is None:
-        print("Sample MRI not found for SHAP explanation.")
-        return
-    # Assume sample_volume is shape [1, D, H, W]
-    volume_np = sample_volume.cpu().numpy()[0]  # (D, H, W)
-    center = volume_np.shape[0] // 2
-    central_slice = volume_np[center]  # (H, W)
-    rng = central_slice.max() - central_slice.min()
-    if rng > 0:
-        norm_slice = (central_slice - central_slice.min()) / (rng + 1e-8)
-    else:
-        norm_slice = central_slice
-    norm_slice = (norm_slice * 255).astype(np.uint8)
-    pil_img = Image.fromarray(norm_slice, mode='L').convert('RGB')
-    np_img_ex = np.array(pil_img)  # shape (H, W, 3)
-
-    # Prepare input for SHAP: add batch dimension => (1, H, W, 3)
-    input_for_shap = np_img_ex[np.newaxis, ...]
-
-    # Create a masker for the image input (using a similar segmentation as in pretraining)
-    masker = shap.maskers.Image(mask_value="inpaint_telea", shape=np_img_ex.shape)
-
-    # Build the wrapper that connects the MRI branch and the attention classifier.
-    wrapper_func = attn_model_wrapper_factory(model, attn_model)
-
-    explainer = shap.Explainer(wrapper_func, masker=masker)
-    explanation = explainer(input_for_shap, max_evals=100)
-    
-    shap.plots.image(explanation, show=False)
-    fig = plt.gcf()  # Get current figure
-    fig.savefig("shap_attention.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print("SHAP explanation saved as shap_attention.png for the attention classifier using MRI input.")
-
-
-
-
-
-###########################################
-# main()
+# MAIN
 ###########################################
 def main():
     # ---------------------
@@ -756,46 +554,57 @@ def main():
         raise ValueError("Need at least 19 patients for pretraining.")
     selected_pats = np.random.choice(all_pats, size=19, replace=False)
     train_pats_pre = selected_pats[:16]
-    val_pats_pre = selected_pats[16:]
+    val_pats_pre   = selected_pats[16:]
     print("Pretraining - Training Patient IDs:", train_pats_pre)
     print("Pretraining - Validation Patient IDs:", val_pats_pre)
     
     train_data = data[data["Patient_ID"].isin(train_pats_pre)]
-    val_data = data[data["Patient_ID"].isin(val_pats_pre)]
+    val_data   = data[data["Patient_ID"].isin(val_pats_pre)]
     train_data = train_data.sort_values(["Patient_ID", "Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
-    val_data = val_data.sort_values(["Patient_ID", "Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
+    val_data   = val_data.sort_values(["Patient_ID", "Timepoint"]).groupby("Patient_ID").head(3).reset_index(drop=True)
     print(f"Training data rows: {len(train_data)}")
     print(f"Validation data rows: {len(val_data)}")
     
-    train_set = CombinedContrastiveDataset(train_data, mri_dict, negative_sample_fraction=6, positive_repeat=2, augment=True)
-    val_set = CombinedContrastiveDataset(val_data, mri_dict, negative_sample_fraction=6, positive_repeat=2, augment=False)
-    train_loader = DataLoader(train_set, batch_size=128, shuffle=True, collate_fn=custom_collate)
-    val_loader = DataLoader(val_set, batch_size=128, shuffle=False, collate_fn=custom_collate)
+    train_set = CombinedContrastiveDataset(
+        train_data, mri_dict, negative_sample_fraction=3, positive_repeat=2, augment=True
+    )
+    val_set = CombinedContrastiveDataset(
+        val_data, mri_dict, negative_sample_fraction=3, positive_repeat=2, augment=False
+    )
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True, collate_fn=custom_collate)
+    val_loader   = DataLoader(val_set,   batch_size=64, shuffle=False, collate_fn=custom_collate)
     
-    micro_dim = train_data.filter(like='Microbiome_').shape[1]
-    biom_dim = train_data.filter(like='Biomarker_').shape[1]
-    other_dim = train_data.filter(like='Other_').shape[1]
-    numeric_dim = train_data.filter(like='mri_numeric_').shape[1]
-    print(f"Micro={micro_dim}, Biom={biom_dim}, Other={other_dim}, Numeric={numeric_dim}")
+    micro_dim_csv   = train_data.filter(like='Microbiome_').shape[1]
+    biom_dim_csv    = train_data.filter(like='Biomarker_').shape[1]
+    other_dim_csv   = train_data.filter(like='Other_').shape[1]
+    numeric_dim_csv = train_data.filter(like='mri_numeric_').shape[1]
+    print(f"Micro={micro_dim_csv}, Biom={biom_dim_csv}, Other={other_dim_csv}, Numeric={numeric_dim_csv}")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MultiModalEmbeddingModel(micro_dim, biom_dim, other_dim, numeric_dim, embed_dim=64, augment=True).to(device)
+    model = MultiModalEmbeddingModel(
+        micro_dim_csv,
+        biom_dim_csv,
+        other_dim_csv,
+        numeric_dim_csv,
+        embed_dim=64,
+        augment=True
+    ).to(device)
     
-    checkpoint_path = "newest.pth"
+    checkpoint_path = "32slice.pth"
     if os.path.exists(checkpoint_path):
-        # Use strict=False to ignore missing keys from the new numeric branch
         model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
         print("Loaded pretrained model checkpoint (strict=False).")
     else:
         optimizer = torch.optim.AdamW([
             {'params': model.mri_encoder.clip_model.vision_model.encoder.parameters(), 'lr': 1e-4},
-            {'params': model.mri_encoder.project.parameters(), 'lr': 5e-3},
-            {'params': model.micro_encoder.parameters(), 'lr': 1e-3},
-            {'params': model.biom_encoder.parameters(), 'lr': 1e-3},
-            {'params': model.other_encoder.parameters(), 'lr': 1e-3},
-            {'params': model.numeric_encoder.parameters(), 'lr': 1e-3},
+            {'params': model.mri_encoder.project.parameters(),                 'lr': 5e-3},
+            {'params': model.micro_encoder.parameters(),                       'lr': 1e-3},
+            {'params': model.biom_encoder.parameters(),                        'lr': 1e-3},
+            {'params': model.other_encoder.parameters(),                       'lr': 1e-3},
+            {'params': model.numeric_encoder.parameters(),                     'lr': 1e-3},
         ], weight_decay=1e-6)
-        total_epochs = 200
+
+        total_epochs = 200  
         val_loss_history = []
         patience_threshold = 5
         for ep in range(1, total_epochs + 1):
@@ -814,20 +623,20 @@ def main():
     other_df = pd.read_csv('/home/tmnthc/New1/Other.csv')
     other_df.rename(columns=lambda x: x.strip(), inplace=True)
     other_df['Patient_ID'] = other_df['Patient_ID'].astype(str).str.strip()
-    other_df['Timepoint'] = other_df['Timepoint'].astype(str).str.strip()
+    other_df['Timepoint']  = other_df['Timepoint'].astype(str).str.strip()
+    # Build a dictionary of patient->APOE4 label
     patient_labels_df = other_df.groupby("Patient_ID")["APOE4"].max().reset_index()
     patient_apoe4 = {row["Patient_ID"]: int(row["APOE4"]) for _, row in patient_labels_df.iterrows()}
     all_patients = np.unique(other_df["Patient_ID"])
     if len(all_patients) < 23:
         raise ValueError("Need at least 23 unique patients for attention classification.")
     
-    # Hyperparams for attention classifier
     num_trials = 1
     ensemble_count = 1
     attn_lr = 1e-3
     attn_weight_decay = 1e-4
-    max_attn_epochs = 1600
-    early_stop_patience = 10
+    max_attn_epochs = 20
+    early_stop_patience = 5
     use_focal_loss = False
     trial_test_accuracies = []
     
@@ -835,20 +644,20 @@ def main():
         print(f"\n=== Attention Classifier Trial {trial+1}/{num_trials} ===")
         selected = np.random.choice(all_patients, size=23, replace=False)
         train_ids = selected[0:16]
-        val_ids = selected[16:19]
-        test_ids = selected[19:23]
+        val_ids   = selected[16:19]
+        test_ids  = selected[19:23]
         print("Trial patient split:")
         print("  Train IDs:", train_ids)
         print("  Validation IDs:", val_ids)
         print("  Test IDs:", test_ids)
     
         train_attn_dataset = AttentionDatasetWithLabels(train_ids, data, mri_dict, model, device, patient_apoe4)
-        val_attn_dataset = AttentionDatasetWithLabels(val_ids, data, mri_dict, model, device, patient_apoe4)
-        test_attn_dataset = AttentionDatasetWithLabels(test_ids, data, mri_dict, model, device, patient_apoe4)
+        val_attn_dataset   = AttentionDatasetWithLabels(val_ids,   data, mri_dict, model, device, patient_apoe4)
+        test_attn_dataset  = AttentionDatasetWithLabels(test_ids,  data, mri_dict, model, device, patient_apoe4)
     
-        train_attn_loader = DataLoader(train_attn_dataset, batch_size=4, shuffle=True, collate_fn=attn_collate_with_labels)
-        val_attn_loader = DataLoader(val_attn_dataset, batch_size=4, shuffle=False, collate_fn=attn_collate_with_labels)
-        test_attn_loader = DataLoader(test_attn_dataset, batch_size=4, shuffle=False, collate_fn=attn_collate_with_labels)
+        train_attn_loader = DataLoader(train_attn_dataset, batch_size=4, shuffle=True,  collate_fn=attn_collate_with_labels)
+        val_attn_loader   = DataLoader(val_attn_dataset,   batch_size=4, shuffle=False, collate_fn=attn_collate_with_labels)
+        test_attn_loader  = DataLoader(test_attn_dataset,  batch_size=4, shuffle=False, collate_fn=attn_collate_with_labels)
     
         ensemble_models = []
         for ens in range(ensemble_count):
@@ -857,7 +666,7 @@ def main():
             optimizer_attn = torch.optim.Adam(attn_model.parameters(), lr=attn_lr, weight_decay=attn_weight_decay)
             if use_focal_loss:
                 from torch.nn import BCEWithLogitsLoss
-                class FocalLoss(nn.Module):
+                class FocalLoss(torch.nn.Module):
                     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
                         super(FocalLoss, self).__init__()
                         self.alpha = alpha
@@ -873,7 +682,7 @@ def main():
                         return focal_loss
                 criterion_attn = FocalLoss(alpha=0.25, gamma=2.0)
             else:
-                criterion_attn = nn.BCEWithLogitsLoss()
+                criterion_attn = torch.nn.BCEWithLogitsLoss()
         
             best_val_loss = float('inf')
             epochs_no_improve = 0
@@ -883,42 +692,51 @@ def main():
                 attn_model.train()
                 total_loss = 0.0
                 for embeddings, labels in train_attn_loader:
+                    # embeddings: (B, 5D, 64)
                     embeddings = embeddings.to(device)
                     labels = labels.to(device).float()
                     optimizer_attn.zero_grad()
-                    logits = attn_model(embeddings)
-                    loss = criterion_attn(logits, labels)
+                    logits = attn_model(embeddings)      # (B, 5D)
+                    logits_agg = logits.mean(dim=1)      # (B,)
+                    loss = criterion_attn(logits_agg, labels)
                     loss.backward()
                     optimizer_attn.step()
                     total_loss += loss.item() * embeddings.size(0)
+    
                 avg_train_loss = total_loss / len(train_attn_dataset)
-            
+    
+                # Validation
                 attn_model.eval()
                 total_val_loss = 0.0
                 with torch.no_grad():
                     for embeddings, labels in val_attn_loader:
                         embeddings = embeddings.to(device)
                         labels = labels.to(device).float()
-                        logits = attn_model(embeddings)
-                        loss = criterion_attn(logits, labels)
+                        logits = attn_model(embeddings)  # (B, 5D)
+                        logits_agg = logits.mean(dim=1)
+                        loss = criterion_attn(logits_agg, labels)
                         total_val_loss += loss.item() * embeddings.size(0)
                 avg_val_loss = total_val_loss / len(val_attn_dataset)
-            
+    
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     epochs_no_improve = 0
                     best_model_state = attn_model.state_dict()
                 else:
                     epochs_no_improve += 1
+    
                 if epochs_no_improve >= early_stop_patience:
                     print(f"    Early stopping at epoch {epoch+1} with best val loss {best_val_loss:.4f}")
                     break
-                if (epoch+1) % 10 == 0 or epoch == 0:
+    
+                if (epoch+1) % 5 == 0 or epoch == 0:
                     print(f"    Epoch {epoch+1}/{max_attn_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            
             if best_model_state is not None:
                 attn_model.load_state_dict(best_model_state)
             ensemble_models.append(attn_model)
     
+        # Evaluate on test set
         total_correct = 0
         total_samples = 0
         with torch.no_grad():
@@ -930,7 +748,8 @@ def main():
                     model_member.eval()
                     ensemble_logits += model_member(embeddings)
                 ensemble_logits /= ensemble_count
-                preds = (ensemble_logits >= 0).float()
+                logits_agg = ensemble_logits.mean(dim=1)
+                preds = (logits_agg >= 0).float()
                 total_correct += (preds == labels).sum().item()
                 total_samples += labels.size(0)
         if total_samples > 0:
@@ -939,35 +758,88 @@ def main():
             trial_test_accuracies.append(trial_accuracy)
         else:
             print("No test samples available in this trial.")
+    
     if trial_test_accuracies:
         avg_test_accuracy = sum(trial_test_accuracies) / len(trial_test_accuracies)
         print(f"\nAverage Ensemble Test Accuracy over {num_trials} trials: {avg_test_accuracy*100:.2f}%")
     else:
         print("No test samples available for attention classification.")
-    
-    # For MRI image branch:
-    pid_for_visual = train_pats_pre[0]
-    first_patient_rows = train_data[train_data["Patient_ID"] == pid_for_visual]
-    if len(first_patient_rows) == 0:
-        print(f"No training data for patient {pid_for_visual}?")
-    else:
-        first_timepoint = first_patient_rows["Timepoint"].iloc[0]
-        print(f"\nComputing SHAP for MRI image: (mri_dict, {pid_for_visual}, {first_timepoint})")
-        compute_shap_for_sample(model, mri_dict, str(pid_for_visual), first_timepoint)
 
-    # Example call within your main():
-    pid_for_visual = train_pats_pre[0]
-    first_patient_rows = train_data[train_data["Patient_ID"] == pid_for_visual]
-    if len(first_patient_rows) == 0:
-        print(f"No training data for patient {pid_for_visual}?")
-    else:
-        first_timepoint = first_patient_rows["Timepoint"].iloc[0]
-        print(f"\nComputing SHAP for Attention Classifier with MRI input: (mri_dict, {pid_for_visual}, {first_timepoint})")
-        compute_shap_for_attention(attn_model=ensemble_models[0], model=model, mri_dict=mri_dict,
-                                pid=str(pid_for_visual), timepoint=first_timepoint)
+    print("\nMRI Samples in dictionary (for debugging):")
+    for key, volume in mri_dict.items():
+        print(f"Patient ID: {key[0]}, Timepoint: {key[1]}, Shape: {volume.shape}")
 
+    ###########################################
+    # 12) Corrected SHAP Analysis on Attention Classifier
+    ###########################################
+    # We'll demonstrate SHAP on a single sample from the training dataset
+    if len(train_attn_dataset) == 0:
+        print("No samples in the attention dataset. Skipping SHAP example.")
+        return
 
+    # Grab the first sample: shape (5D, 64) and its label
+    sample_embedding, sample_label = train_attn_dataset[0]   # (T, 64), T=5*D
+    T = sample_embedding.shape[0]                            # T = 5 * (#slices)
+    # Flatten to (T*64,)
+    sample_input_flat = sample_embedding.view(-1).cpu().numpy()
 
+    # We also need the trained attention model to do the forward pass:
+    # If you have an ensemble, use the final model or an ensemble average.
+    # Here we just pick the first ensemble model for demonstration:
+    attn_model = ensemble_models[0].eval()
+
+    def attention_classifier_wrapper(X):
+        """
+        X: shape (B, T*64)
+        Return: shape (B,) of logits 
+        """
+        X_torch = torch.from_numpy(X).float().to(device)  # (B, T*64)
+        B = X_torch.shape[0]
+        # Reshape back to (B, T, 64) so we can run it through the attention classifier
+        X_torch = X_torch.view(B, T, 64)
+        with torch.no_grad():
+            logits = attn_model(X_torch)    # shape (B, T)
+            # If the final classification is the mean of slice logits:
+            logits_agg = logits.mean(dim=1) # (B,)
+        return logits_agg.cpu().numpy()
+
+    # Baseline for KernelSHAP (here we use a zero-vector)
+    baseline = np.zeros((1, T * 64), dtype=np.float32)
+
+    # Build explainer
+    explainer = shap.KernelExplainer(attention_classifier_wrapper, baseline)
+
+    # We'll compute SHAP values for our single sample
+    shap_values = explainer.shap_values(
+        np.expand_dims(sample_input_flat, axis=0),  # shape (1, T*64)
+        nsamples=100
+    )
+    # shap_values: shape (1, T*64) because we have 1 sample in the call
+
+    shap_vals_flat = shap_values[0]  # shape (T*64,)
+
+    # Because we stacked the 5 modalities in order: [MRI, Micro, Biom, Other, Numeric]
+    # each repeated for D slices, we can define slices in the *token dimension*:
+    # - MRI tokens = [0 .. D)
+    # - Micro     = [D .. 2D)
+    # - Biom      = [2D .. 3D)
+    # - Other     = [3D .. 4D)
+    # - Numeric   = [4D .. 5D)
+    #
+    # Each token is 64 embedding dims, so in the flattened shape we multiply by 64.
+    D = T // 5
+    modality_indices = {
+        "MRI":     slice(0 * D * 64, 1 * D * 64),
+        "Micro":   slice(1 * D * 64, 2 * D * 64),
+        "Biom":    slice(2 * D * 64, 3 * D * 64),
+        "Other":   slice(3 * D * 64, 4 * D * 64),
+        "Numeric": slice(4 * D * 64, 5 * D * 64),
+    }
+
+    print("\nModality-level SHAP importance (absolute sum):")
+    for mod_name, idx_slice in modality_indices.items():
+        importance_val = np.sum(np.abs(shap_vals_flat[idx_slice]))
+        print(f"  {mod_name}: {importance_val:.4f}")
 
 if __name__ == "__main__":
     main()
