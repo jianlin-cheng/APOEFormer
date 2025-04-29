@@ -750,7 +750,7 @@ def evaluate_region_impacts_multi_timepoint(full_model, data_df, mri_orig, maske
                     break
                 row = row.iloc[0]
                 def make(x):
-                    v = pd.to_numeric(row.filter(like=x), errors='coerce').fillna(0).values
+                    v = pd.to_numeric(row.filter(like=x), errors='coerce').fillna(0).valuesf
                     return torch.from_numpy(v.astype(np.float32)).unsqueeze(0)
                 micro = make("Microbiome_").to(device).half()
                 biom  = make("Biomarker_").to(device).half()
@@ -1176,7 +1176,6 @@ def main():
         # 1) wrap your trained models
         full_model = FullModel(model, ensemble_models[0]).to(device)
         full_model.eval()
-        full_model.half()
 
         # 2) build a lookup dict for every (pid,tp,region)
         masked_paths = {
@@ -1197,14 +1196,22 @@ def main():
         if df_impacts.empty:
             print("⚠️ No region impacts computed…")
         else:
-            # --- group, sort, and save summary only ---
-            region_means = df_impacts.groupby("Region")["Delta"]\
-                                    .mean()\
-                                    .sort_values(ascending=True)
-            summary = region_means.reset_index().rename(columns={"Delta":"MeanDelta"})
-            print("Mean Δ‐logit by region (ascending):")
+            # After computing df_impacts…
+            # → Compute signed mean (optional)
+            signed_means = df_impacts.groupby("Region")["Delta"].mean()
+            # → Compute absolute mean deltas and sort descending
+            abs_means    = signed_means.abs().sort_values(ascending=False)
+            # → Build a summary DataFrame showing both signed & absolute
+            summary = pd.DataFrame({
+                "Region":       abs_means.index,
+                "MeanDelta":    signed_means.loc[abs_means.index].values,
+                "MeanAbsDelta": abs_means.values
+            })
+            print("Mean |Δ‐logit| by region (desc):")
             print(summary)
+            # → Save by absolute importance
             summary.to_csv(f"region_impacts_summary_run{run}.csv", index=False)
+
                 # ─────────────────────────────────────────────────────────────────────────
 
        
@@ -1247,12 +1254,12 @@ def main():
     
        
 
-        if len(train_attn_dataset) > 0:
+        if len(train_attn_ds) > 0:
             # Pick your explainer model (first ensemble member)
             attn_model_for_shap = ensemble_models[0].eval()
 
             # Grab a single sample to get T and E
-            sample_embedding, _ = train_attn_dataset[0]   # shape (T, E)
+            sample_embedding, _ = train_attn_ds[0]   # shape (T, E)
             sample_input_flat = sample_embedding.view(-1).cpu().numpy()
 
             T, E = sample_embedding.shape  
