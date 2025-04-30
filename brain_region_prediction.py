@@ -750,23 +750,23 @@ def evaluate_region_impacts_multi_timepoint(full_model, data_df, mri_orig, maske
                     break
                 row = row.iloc[0]
                 def make(x):
-                    v = pd.to_numeric(row.filter(like=x), errors='coerce').fillna(0).valuesf
+                    v = pd.to_numeric(row.filter(like=x), errors='coerce').fillna(0).values
                     return torch.from_numpy(v.astype(np.float32)).unsqueeze(0)
-                micro = make("Microbiome_").to(device).half()
-                biom  = make("Biomarker_").to(device).half()
-                other = make("Other_").to(device).half()
-                num   = make("mri_numeric_").to(device).half()
+                micro = make("Microbiome_").to(device)
+                biom  = make("Biomarker_").to(device)
+                other = make("Other_").to(device)
+                num   = make("mri_numeric_").to(device)
 
                 # run embeddings
                 with torch.no_grad():
                     # original
                     e_o, m_mic, m_bio, m_oth, m_num = full_model.emb(
-                        img_o.to(device).unsqueeze(0).half(),
+                        img_o.to(device).unsqueeze(0),
                         micro, biom, other, num
                     )
                     # masked
                     e_m, _, _, _, _ = full_model.emb(
-                        img_m.to(device).unsqueeze(0).half(),
+                        img_m.to(device).unsqueeze(0),
                         micro, biom, other, num
                     )
 
@@ -787,16 +787,30 @@ def evaluate_region_impacts_multi_timepoint(full_model, data_df, mri_orig, maske
 
             # final forward pass
             with torch.no_grad():
-                logit_o = full_model.attn(seq_orig).mean(dim=1).item()
-                logit_m = full_model.attn(seq_mask).mean(dim=1).item()
+                # get the raw logits (shape [1])
+                scores_orig = full_model.attn(seq_orig).mean(dim=1)
+                scores_mask = full_model.attn(seq_mask).mean(dim=1)
+
+                # convert to probabilities
+                p_o = torch.sigmoid(scores_orig).item()
+                p_m = torch.sigmoid(scores_mask).item()
+
+                # both logit‐ and prob‐level deltas
+                logit_o, logit_m = scores_orig.item(), scores_mask.item()
+                delta_logits = logit_o - logit_m
+                delta_probs  = p_o    - p_m
 
             results.append({
-                "Patient": pid,
-                "Region": region,
-                "Logit_orig": logit_o,
-                "Logit_mask": logit_m,
-                "Delta": logit_o - logit_m
+                "Patient":     pid,
+                "Region":      region,
+                "Logit_orig":  logit_o,
+                "Logit_mask":  logit_m,
+                "Delta":       delta_logits,
+                "Prob_orig":   p_o,
+                "Prob_mask":   p_m,
+                "Delta_prob":  delta_probs
             })
+
 
     df = pd.DataFrame(results, columns=["Patient","Region","Logit_orig","Logit_mask","Delta"])
     print(f"[INFO] Multi‐TP region‐impact done in {time.time()-start:.1f}s; {len(df)} entries.")
@@ -865,7 +879,7 @@ def main():
     import numpy as np
     import pandas as pd
 
-    mask_root = "/home/tmnthc/mask"
+    mask_root = "/home/tmnthc/result"
 
     from torch.utils.data import DataLoader
 
@@ -1266,12 +1280,14 @@ def main():
             baseline = np.zeros((1, T * E), dtype=np.float32)
 
             def attention_wrapper(X):
-                X_t = torch.from_numpy(X).half().to(device)   # ← use .half() here
+                # make X_t float32 to match your model’s parameters
+                X_t = torch.from_numpy(X).float().to(device)
                 B = X_t.shape[0]
                 X_t = X_t.view(B, T, E)
                 with torch.no_grad():
                     logits = attn_model_for_shap(X_t)
                 return logits.mean(dim=1).cpu().numpy()
+
 
             explainer    = shap.KernelExplainer(attention_wrapper, baseline)
             shap_values  = explainer.shap_values(
