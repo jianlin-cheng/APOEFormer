@@ -3,6 +3,7 @@ from torch.cuda.amp import GradScaler, autocast
 import random
 import numpy as np
 import torch
+import os
 
 # Set random seeds for reproducibility
 seed = 42
@@ -16,8 +17,11 @@ torch.backends.cudnn.benchmark = False
 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+import wandb
+MASKED_CACHE_DIR = "/bmlfast/tom/masked_mri_cache"
+os.makedirs(MASKED_CACHE_DIR, exist_ok=True)
 
-
+from torch.nn import DataParallel
 import os
 import math
 import pandas as pd
@@ -31,11 +35,12 @@ from transformers import CLIPProcessor, CLIPModel
 import torchvision.transforms as T
 # import cv2  # for resizing heatmaps
 import shap  # SHAP
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import torch
 print(torch.__version__)
 torch.cuda.empty_cache()
 
+import torch
 
 ###########################################
 # 1) CSV Data Loading & Merging
@@ -53,13 +58,13 @@ def load_file(file_path, drop_apoe4=True):
 
 def load_data():
     # Load existing CSV files.
-    microbiome = load_file('/home/tmnthc/New1/Microbiome.csv')
-    blood_metabolites = load_file('/home/tmnthc/New1/Blood_Metabolites.csv')
-    inflammatory_markers = load_file('/home/tmnthc/New1/Sirolimus_inflammatory_markers.csv')
-    blood_data = load_file('/home/tmnthc/New1/Sirolimus_Blood_Data.csv')
-    other_data = load_file('/home/tmnthc/New1/Other.csv', drop_apoe4=True)
+    microbiome = load_file('/bmlfast/tom/New1/Microbiome.csv')
+    blood_metabolites = load_file('/bmlfast/tom//New1/Blood_Metabolites.csv')
+    inflammatory_markers = load_file('//bmlfast/tom/New1/Sirolimus_inflammatory_markers.csv')
+    blood_data = load_file('/bmlfast/tom//New1/Sirolimus_Blood_Data.csv')
+    other_data = load_file('/bmlfast/tom//New1/Other.csv', drop_apoe4=True)
     # Load the new numeric modality.
-    brain_cbf = load_file('/home/tmnthc/New1/Brain_CBF_Imaging.csv', drop_apoe4=False)
+    brain_cbf = load_file('/bmlfast/tom//New1/Brain_CBF_Imaging.csv', drop_apoe4=False)
 
     for name, df in zip(
         ["Microbiome", "Blood Metabolites", "Inflammatory Markers", "Blood Data", "Other", "Brain_CBF"],
@@ -117,57 +122,95 @@ def load_data():
 ###########################################
 # 2) MRI Data Loading (for brain imaging)
 ###########################################
-def load_mri_data(root_dir):
+import os
+import torch
+import numpy as np
+import nibabel as nib
+
+def load_mri_data(
+    root_dir,
+    cache_dir=None,
+    device="cpu",
+    allowed_timepoints=("Baseline", "Washout", "Post")
+):
     """
-    Walks root_dir/<patient_id>/<timepoint>/*.nii(.gz)
-    Returns dict[(patient_id, timepoint)] -> FloatTensor [1,H,W,D]
-    with debug prints for each load.
+    Only loads/caches those sub-folders whose name is in allowed_timepoints.
     """
     mri_dict = {}
-    total_loaded = 0
+    total_cached = total_computed = 0
 
-    for patient_id in os.listdir(root_dir):
-        patient_path = os.path.join(root_dir, patient_id)
-        if not os.path.isdir(patient_path):
+    # 1) Load from cache
+    if cache_dir and os.path.isdir(cache_dir):
+        for fn in os.listdir(cache_dir):
+            if not fn.endswith(".pt"):
+                continue
+            name = fn[:-3]  # strip .pt
+            pid, tp = name.split("_", 1)
+            if tp not in allowed_timepoints:
+                continue
+            path = os.path.join(cache_dir, fn)
+            try:
+                emb = torch.load(path, map_location="cpu")  # (1,H,W,D) or (1,D,E)
+                mri_dict[(pid, tp)] = emb
+                total_cached += 1
+            except Exception as e:
+                print(f"⚠️ Failed to load cache {path}: {e}")
+
+    if total_cached:
+        print(f"[INFO] Loaded {total_cached} MRI entries from cache.")
+
+    # 2) Walk raw NIfTI tree for missing ones
+    for pid in os.listdir(root_dir):
+        pid_path = os.path.join(root_dir, pid)
+        if not os.path.isdir(pid_path):
             continue
-        print(f"[INFO] Patient '{patient_id}' found, scanning timepoints...")
 
-        # each subfolder is a timepoint
-        for timepoint in os.listdir(patient_path):
-            tp_path = os.path.join(patient_path, timepoint)
+        for tp in os.listdir(pid_path):
+            if tp not in allowed_timepoints:
+                continue
+
+            key = (pid, tp)
+            if key in mri_dict:
+                continue
+
+            tp_path = os.path.join(pid_path, tp)
             if not os.path.isdir(tp_path):
                 continue
-            print(f"  [INFO] Timepoint '{timepoint}' folder: {tp_path}")
 
-            # find the first NIfTI in that folder
-            nii_file = None
-            for fn in os.listdir(tp_path):
-                if fn.endswith(".nii") or fn.endswith(".nii.gz"):
-                    nii_file = fn
-                    break
-
-            if nii_file is None:
-                print(f"  [WARN]   No .nii/.nii.gz file in {tp_path}, skipping timepoint.")
+            # find a .nii or .nii.gz
+            nii_fn = next(
+                (f for f in os.listdir(tp_path) 
+                 if f.endswith(".nii") or f.endswith(".nii.gz")),
+                None
+            )
+            if not nii_fn:
+                print(f"  [WARN] No NIfTI in {tp_path}, skipping.")
                 continue
 
-            full_path = os.path.join(tp_path, nii_file)
-            print(f"  [INFO]   Found file '{nii_file}', loading...")
+            full_nii = os.path.join(tp_path, nii_fn)
+            arr = nib.load(full_nii).get_fdata()
+            # squeeze singleton 4th dim
+            if arr.ndim == 4 and arr.shape[-1] == 1:
+                arr = np.squeeze(arr, axis=-1)
 
-            # Load and normalize
-            img = nib.load(full_path).get_fdata()
-            if img.ndim == 4 and img.shape[-1] == 1:
-                img = np.squeeze(img, axis=-1)
-            mean, std = img.mean(), img.std()
-            img = (img - mean) / (std + 1e-8)
+            # normalize per-volume
+            mean, std = arr.mean(), arr.std()
+            norm = (arr - mean) / (std + 1e-8)
+            tensor = torch.from_numpy(norm.astype(np.float32)).unsqueeze(0)
 
-            # Convert to tensor
-            mri_tensor = torch.from_numpy(img.astype(np.float32)).unsqueeze(0)
-            mri_dict[(patient_id, timepoint)] = mri_tensor
+            mri_dict[key] = tensor
+            total_computed += 1
 
-            print(f"  [INFO]   Loaded tensor shape {mri_tensor.shape}")
-            total_loaded += 1
+            # cache the normalized tensor
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+                cache_path = os.path.join(cache_dir, f"{pid}_{tp}.pt")
+                torch.save(tensor.cpu(), cache_path)
 
-    print(f"[INFO] Finished loading MRI data: {total_loaded} volumes added.")
+    if total_computed:
+        print(f"[INFO] Computed & cached {total_computed} new MRI entries.")
+
+    print(f"[INFO] Finished loading MRI data: {len(mri_dict)} entries.")
     return mri_dict
 
 ###########################################
@@ -194,7 +237,7 @@ def augment_numeric(x, noise_std=0.05):
 # 3) MRIClipEncoder
 ###########################################
 class MRIClipEncoder(nn.Module):
-    def __init__(self, embed_dim=32, augment=False, dropout_p=0.1):
+    def __init__(self, embed_dim=32, augment=False, dropout_p=0.3):
         super().__init__()
         self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         for param in self.clip_model.parameters():
@@ -230,6 +273,15 @@ class MRIClipEncoder(nn.Module):
         Batches all B*D slices into a single CLIP forward pass for speed.
         Returns: (B, D, embed_dim)
         """
+          # ——— fast‐path for cached embeddings ———
+        if mri_batch.dim() == 3:
+            # Already (B, D, E)
+            return mri_batch
+        if mri_batch.dim() == 4:
+            # (B,1,D,E) → squeeze out the dummy channel
+            return mri_batch.squeeze(1)
+
+        # ——— original 5D volume pipeline follows below ———
         device = mri_batch.device
         B, _, H, W, D = mri_batch.shape
 
@@ -279,27 +331,44 @@ class MRIClipEncoder(nn.Module):
 # 4) MLPEncoder for Numeric Data
 ###########################################
 class MLPEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim=64, augment=False, dropout_p=0.1):
+    def __init__(self, input_dim, output_dim=64, hidden_dims=[256,256,256], 
+                 dropout_p=0.3, use_gelu=True):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, 256)
-        self.layernorm1 = nn.LayerNorm(256)
-        self.fc2 = nn.Linear(256, 256)
-        self.layernorm2 = nn.LayerNorm(256)
-        self.fc3 = nn.Linear(256, output_dim)
-        self.layernorm3 = nn.LayerNorm(output_dim)
-        self.dropout = nn.Dropout(dropout_p)
-        self.augment = augment
+        self.layers = nn.ModuleList()
+        dims = [input_dim] + hidden_dims + [output_dim]
+        for i in range(len(dims)-1):
+            self.layers.append(nn.Linear(dims[i], dims[i+1]))
+            self.layers.append(nn.LayerNorm(dims[i+1]))
+            self.layers.append(nn.GELU() if use_gelu else nn.ReLU())
+            self.layers.append(nn.Dropout(dropout_p))
+        self.out_norm = nn.LayerNorm(output_dim)
 
     def forward(self, x):
-        out1 = self.layernorm1(self.fc1(x))
-        act1 = F.relu(out1)
-        act1 = self.dropout(act1)
-        out2 = self.layernorm2(self.fc2(act1))
-        act2 = F.relu(out2)
-        act2 = self.dropout(act2)
-        res = act1 + act2
-        out3 = self.layernorm3(self.fc3(res))
-        return safe_normalize(out3, p=2, dim=-1)
+        h = x
+        # Process blocks of 4 layers at a time
+        for i in range(0, len(self.layers), 4):
+            lin   = self.layers[i]     # Linear
+            norm  = self.layers[i+1]   # LayerNorm
+            act   = self.layers[i+2]   # Activation
+            drop  = self.layers[i+3]   # Dropout
+
+            # apply them in sequence
+            fwd = lin(h)
+            fwd = norm(fwd)
+            fwd = act(fwd)
+            fwd = drop(fwd)
+
+            # add residual if same shape
+            if fwd.shape == h.shape:
+                h = h + fwd
+            else:
+                h = fwd
+
+        # final normalization + L2
+        h = self.out_norm(h)
+        return F.normalize(h, p=2, dim=-1)
+
+
 
 ###########################################
 # 5) CombinedContrastiveDataset
@@ -325,7 +394,7 @@ class CombinedContrastiveDataset(Dataset):
 
         # Label=1 for positives, label=0 for negatives
         self.samples = [(s, 1) for s in self.positive_samples] + [(s, 0) for s in self.negative_samples]
-        print(f"Total combined samples: {len(self.samples)}")
+        # print(f"Total combined samples: {len(self.samples)}")
 
     def __len__(self):
         return len(self.samples)
@@ -377,7 +446,7 @@ def custom_collate(batch):
 ###########################################
 # 6) Patient Contrastive Loss
 ###########################################
-def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, e_numeric, sample_labels, tau=0.5):
+def patient_contrastive_loss(e_mri, e_micro, e_biom, e_other, e_numeric, sample_labels, tau=0.2):
     """
     e_mri, e_micro, e_biom, e_other, e_numeric: (B, embed_dim)
     We combine them into a big matrix of shape (5*B, embed_dim).
@@ -408,10 +477,10 @@ class MultiModalEmbeddingModel(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.mri_encoder = MRIClipEncoder(embed_dim=embed_dim, augment=augment)
-        self.micro_encoder = MLPEncoder(input_dim=micro_dim, output_dim=embed_dim, augment=augment)
-        self.biom_encoder = MLPEncoder(input_dim=biom_dim, output_dim=embed_dim, augment=augment)
-        self.other_encoder = MLPEncoder(input_dim=other_dim, output_dim=embed_dim, augment=augment)
-        self.numeric_encoder = MLPEncoder(input_dim=numeric_dim, output_dim=embed_dim, augment=augment)
+        self.micro_encoder = MLPEncoder(input_dim=micro_dim, output_dim=embed_dim)
+        self.biom_encoder = MLPEncoder(input_dim=biom_dim, output_dim=embed_dim)
+        self.other_encoder = MLPEncoder(input_dim=other_dim, output_dim=embed_dim)
+        self.numeric_encoder = MLPEncoder(input_dim=numeric_dim, output_dim=embed_dim)
 
     def forward(self, mri, micro, biom, other, numeric):
         e_mri = self.mri_encoder(mri)   # (B, D, embed_dim)
@@ -428,6 +497,9 @@ class MultiModalEmbeddingModel(nn.Module):
 def train_epoch(model, loader, optimizer, device, epoch,
                 val_loss_history, patience_threshold=5,
                 accum_steps=4, scaler=None):
+    # ─── 1) unwrap DataParallel/DDP ──────────────────────────────────────────────
+    base_model = model.module if hasattr(model, "module") else model
+
     model.train()
     total_loss = 0.0
     optimizer.zero_grad()
@@ -442,9 +514,11 @@ def train_epoch(model, loader, optimizer, device, epoch,
 
         # mixed‐precision forward + loss
         with torch.cuda.amp.autocast():
-
-            e_mri, e_micro, e_biom, e_other, e_numeric = model(mri, micro, biom, other, mri_numeric)
-        
+            # you can still call `model(...)` here or `base_model(...)`—
+            # it doesn’t matter for forwarding
+            e_mri, e_micro, e_biom, e_other, e_numeric = model(
+                mri, micro, biom, other, mri_numeric
+            )
             e_mri_mean = e_mri.mean(dim=1)
             loss = patient_contrastive_loss(
                 e_mri_mean, e_micro, e_biom, e_other, e_numeric,
@@ -455,7 +529,8 @@ def train_epoch(model, loader, optimizer, device, epoch,
         scaler.scale(loss).backward()
         if (batch_idx + 1) % accum_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # ─── NOTE: gradient clipping on the *base* model’s params ───────────
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -464,12 +539,13 @@ def train_epoch(model, loader, optimizer, device, epoch,
 
     avg_loss = total_loss / len(loader)
 
-    # This is where we can gradually unfreeze more CLIP layers if val loss is not improving
+    # ─── 2) use base_model when unfreezing ────────────────────────────────────
     if len(val_loss_history) > 0 and avg_loss >= max(val_loss_history[-patience_threshold:]):
-        model.mri_encoder.gradually_unfreeze(
+        base_model.mri_encoder.gradually_unfreeze(
             current_patience=patience_threshold,
             max_patience=patience_threshold
         )
+
     return avg_loss
 
 def validate_epoch(model, loader, device):
@@ -496,31 +572,83 @@ def validate_epoch(model, loader, device):
 ###########################################
 # 9) Stacked Multi-Head Attention Classifier
 ###########################################
-class StackedAttentionClassifier(nn.Module):
-    def __init__(self, embed_dim=32, num_heads=4, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True))
-        self.dropout = nn.Dropout(dropout)
-        self.layernorm = nn.LayerNorm(embed_dim)
-        self.fuse = nn.Linear(embed_dim*2, embed_dim)
-        self.classifier = nn.Linear(embed_dim, 1)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-    def forward(self, embeddings):
+class StackedAttentionClassifier(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int = 32,
+        num_heads: int = 4,
+        num_layers: int = 3,
+        dropout: float = 0.3,
+        max_seq_len: int = 2048          # adjust to your max token length
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+
+        # 1) Classification token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        # 2) Learned positional embeddings (for CLS + all tokens)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len + 1, embed_dim))
+
+        # 3) Stacked TransformerEncoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+
+        # 4) Final MLP head on the CLS embedding
+        self.layernorm = nn.LayerNorm(embed_dim)
+        self.mlp_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, 1)
+        )
+
+        # initialize
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        embeddings: (B, T, embed_dim)
-        returns: (B, T) with a logit per token
+        x: (B, T, embed_dim)   token embeddings for each slice
+        returns: (B,)          one logit per sample
         """
-        residual = embeddings
-        out = embeddings
-        for layer in self.layers:
-            attn_output, _ = layer(out, out, out)
-            out = self.layernorm(out + self.dropout(attn_output))
-        fused = torch.cat([residual, out], dim=-1)  # shape (B, T, 2*embed_dim)
-        fused = F.relu(self.fuse(fused))            # shape (B, T, embed_dim)
-        logits = self.classifier(fused)             # shape (B, T, 1)
-        return logits.squeeze(-1)                   # shape (B, T)
+        B, T, E = x.shape
+        assert E == self.embed_dim, "Embed dim mismatch!"
+
+        # prepend a CLS token to the sequence
+        cls_tokens = self.cls_token.expand(B, -1, -1)       # (B,1,E)
+        x = torch.cat([cls_tokens, x], dim=1)               # (B, T+1, E)
+
+        # add positional embeddings (trim/pad if necessary)
+        pos = self.pos_embed[:, : T + 1, :]                 # (1, T+1, E)
+        x = x + pos
+
+        # run through Transformer stack
+        x = self.transformer(x)                             # (B, T+1, E)
+
+        # take the CLS output for classification
+        cls_out = x[:, 0, :]                                # (B, E)
+        cls_out = self.layernorm(cls_out)
+
+        # MLP head → scalar logit
+        logits = self.mlp_head(cls_out)                     # (B, 1)
+        return logits.squeeze(-1)                           # (B,)
+
+             # shape (B, T)
 
 import torch
 from torch.utils.data import Dataset
@@ -571,7 +699,12 @@ class AttentionDatasetWithLabels(Dataset):
         self.emb_model = emb_model.to(device).eval()
         self.attn_model = attn_model.to(device).eval()
 
-        E = emb_model.embed_dim  
+        # NEW—unpack DDP/DataParallel if needed
+        base_model = emb_model.module if hasattr(emb_model, "module") else emb_model
+
+        # now grab the embed dim from the raw model
+        # if you defined embed_dim on MultiModalEmbeddingModel:
+        E = base_model.embed_dim 
 
         for pid in patient_ids:
             # collect per-timepoint token sequences
@@ -635,28 +768,38 @@ class AttentionDatasetWithLabels(Dataset):
         return self.samples[idx]
 
 
+import os, zipfile
+
 def list_masked_paths(mask_root, timepoints):
-    """
-    Returns list of tuples (pid, tp, region, full_path)
-    without loading any data.
-    """
-    import os
     paths = []
     for pid in os.listdir(mask_root):
         pid_dir = os.path.join(mask_root, pid)
+        if not os.path.isdir(pid_dir): continue
 
-        if not os.path.isdir(pid_dir):
-            continue
         for tp in timepoints:
             tp_dir = os.path.join(pid_dir, tp)
-            if not os.path.isdir(tp_dir):
+            if not os.path.isdir(tp_dir): 
+                print(f"  [SKIP] no folder {tp_dir}")
                 continue
+
             for fn in os.listdir(tp_dir):
+                full = os.path.join(tp_dir, fn)
+
                 if fn.endswith(".nii") or fn.endswith(".nii.gz"):
                     region = fn.rsplit(".nii",1)[0]
-                    full = os.path.join(tp_dir, fn)
                     paths.append((pid, tp, region, full))
+
+                elif fn.endswith(".nii.zip"):
+                    region = fn.rsplit(".nii.zip",1)[0]
+                    # extract into a temp file-like object
+                    def loader():
+                        with zipfile.ZipFile(full, "r") as z:
+                            # assume there's exactly one file inside
+                            inner = z.namelist()[0]
+                            return z.open(inner)
+                    paths.append((pid, tp, region, loader))
     return paths
+
 
 
 import torch
@@ -696,125 +839,140 @@ class FullModel(torch.nn.Module):
 
     
 
-def evaluate_region_impacts_multi_timepoint(full_model, data_df, mri_orig, masked_paths, timepoints):
+
+def evaluate_region_impacts_multi_timepoint(
+    full_model,
+    data_df: pd.DataFrame,
+    mri_orig: dict[tuple[str,str], torch.Tensor],
+    masked_cache_dir: str,
+    timepoints: list[str]
+):
     """
-    For each patient and each region, concatenates the 3 visits (Baseline, Washout, Post)
-    into one long token sequence, once with the original MRIs and once with the same region masked
-    at all three timepoints. Returns a DataFrame of Δ‐logits per (Patient, Region).
-    
-    full_model: embedding+attention wrapped model, eval + half on GPU
-    data_df: merged pandas DataFrame with Patient_ID, Timepoint, and static features
-    mri_orig: dict[(pid, tp)] -> CPU tensor [1,H,W,D] of original MRIs
-    masked_paths: dict[(pid, tp, region)] -> filepath of masked NIfTI
-    timepoints: list of 3 timepoint names, e.g. ["Baseline","Washout","Post"]
+    For each patient & region, concatenates Baseline/Washout/Post into one long token
+    sequence (orig vs. masked‐.pt), runs your attention head, and returns Δ‐logits
+    (+ probs) per (Patient, Region).
     """
-    import torch, pandas as pd, nibabel as nib, numpy as np, time
+    import os, time, torch, pandas as pd
+    from torch.utils.data import DataLoader
 
     full_model.eval()
     device = next(full_model.parameters()).device
-    results = []
     start = time.time()
 
-    # gather unique patients & regions
-    patients = sorted({pid for pid,_,_ in masked_paths})
-    regions  = sorted({reg for *_, reg in masked_paths})
+    # 1) index all your .pt masks
+    mask_index: dict[tuple[str,str,str], str] = {}
+    for fn in os.listdir(masked_cache_dir):
+        if not fn.endswith(".pt"):
+            continue
+        pid, tp, region = fn[:-3].split("_", 2)
+        mask_index[(pid, tp, region)] = os.path.join(masked_cache_dir, fn)
+    print(f"[DEBUG] Indexed {len(mask_index)} masked .pt volumes from '{masked_cache_dir}'")
 
-    for pid in patients:
-        for region in regions:
-            # check all three masks exist
-            print(f"[DEBUG] Patient={pid} | Region={region}")
-            keys_mask = [(pid, tp, region) for tp in timepoints]
-            if not all(k in masked_paths for k in keys_mask):
-                print(f"  [SKIP] Missing mask for one of {keys_mask}")
-                continue
+    # 2) find all pid/region with all 3 tps
+    patients = sorted({pid for pid, _ in mri_orig.keys()})
+    regions  = sorted({reg for _,_,reg in mask_index.keys()})
+    to_process = [
+        (pid, region)
+        for pid in patients
+        for region in regions
+        if all(((pid, tp) in mri_orig and (pid, tp, region) in mask_index)
+               for tp in timepoints)
+    ]
+    print(f"[DEBUG] Found {len(to_process)} valid patient-region pairs: {to_process[:5]}{'...' if len(to_process)>5 else ''}")
 
-            #--- build original concatenated embedding ---#
-            seqs_orig = []
-            seqs_mask = []
-            for tp in timepoints:
-                # load and normalize original MRI
-                img_o = mri_orig.get((pid, tp))
-                if img_o is None:
-                    seqs_orig = seqs_mask = None
-                    break
-                # load and normalize masked MRI
-                path = masked_paths[(pid, tp, region)]
-                arr = nib.load(path).get_fdata()
-                arr = (arr - arr.mean())/(arr.std()+1e-8)
-                img_m = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
+    # 3) build your orig vs. masked sequences
+    seq_pairs = []
+    for idx, (pid, region) in enumerate(to_process, 1):
+        print(f"[DEBUG] ({idx}/{len(to_process)}) Processing Patient={pid}, Region={region}")
+        seqs_o, seqs_m = [], []
+        for tp in timepoints:
+            print(f"  [DEBUG] Timepoint={tp}")
+            # original MRI embedding
+            img_o = mri_orig[(pid, tp)].unsqueeze(0).to(device)
+            print(f"    [DEBUG] Orig tensor shape: {img_o.shape}")
 
-                # extract static features at this tp
-                row = data_df[(data_df.Patient_ID==pid)&(data_df.Timepoint==tp)]
-                if row.empty:
-                    seqs_orig = seqs_mask = None
-                    break
-                row = row.iloc[0]
-                def make(x):
-                    v = pd.to_numeric(row.filter(like=x), errors='coerce').fillna(0).values
-                    return torch.from_numpy(v.astype(np.float32)).unsqueeze(0)
-                micro = make("Microbiome_").to(device)
-                biom  = make("Biomarker_").to(device)
-                other = make("Other_").to(device)
-                num   = make("mri_numeric_").to(device)
+            # masked MRI tensor
+            mask_path = mask_index[(pid, tp, region)]
+            img_m = torch.load(mask_path, map_location="cpu").unsqueeze(0).to(device)
+            print(f"    [DEBUG] Masked tensor loaded from {mask_path}, shape: {img_m.shape}")
 
-                # run embeddings
-                with torch.no_grad():
-                    # original
-                    e_o, m_mic, m_bio, m_oth, m_num = full_model.emb(
-                        img_o.to(device).unsqueeze(0),
-                        micro, biom, other, num
-                    )
-                    # masked
-                    e_m, _, _, _, _ = full_model.emb(
-                        img_m.to(device).unsqueeze(0),
-                        micro, biom, other, num
-                    )
+            # static features
+            row = data_df[(data_df.Patient_ID==pid)&(data_df.Timepoint==tp)]
+            if row.empty:
+                raise ValueError(f"Missing static data for {pid}/{tp}")
+            row = row.iloc[0]
 
-                # tile static across slices and stack
-                B, D, E = e_o.shape
-                def tile(x): return x.unsqueeze(1).repeat(1, D, 1)
-                seq_o = torch.cat([e_o, tile(m_mic), tile(m_bio), tile(m_oth), tile(m_num)], dim=1)
-                seq_m = torch.cat([e_m, tile(m_mic), tile(m_bio), tile(m_oth), tile(m_num)], dim=1)
-                seqs_orig.append(seq_o)
-                seqs_mask.append(seq_m)
+            def to_tensor(pref):
+                vals = row.filter(like=pref).astype(float).fillna(0).values
+                t = torch.from_numpy(vals.astype("float32")).unsqueeze(0).to(device)
+                print(f"    [DEBUG] Static '{pref}' tensor shape: {t.shape}")
+                return t
 
-            if seqs_orig is None:
-                continue
+            micro = to_tensor("Microbiome_")
+            biom   = to_tensor("Biomarker_")
+            other  = to_tensor("Other_")
+            num    = to_tensor("mri_numeric_")
 
-            # concatenate timepoints: each seq is (1,5*D,E), now (1,3*5*D,E)
-            seq_orig = torch.cat(seqs_orig, dim=1)
-            seq_mask = torch.cat(seqs_mask, dim=1)
-
-            # final forward pass
+            # embed both
             with torch.no_grad():
-                # get the raw logits (shape [1])
-                scores_orig = full_model.attn(seq_orig).mean(dim=1)
-                scores_mask = full_model.attn(seq_mask).mean(dim=1)
+                e_o, e_micro, e_biom, e_other, e_num = full_model.emb(
+                    img_o, micro, biom, other, num
+                )
+                e_m, *_ = full_model.emb(
+                    img_m, micro, biom, other, num
+                )
+            print(f"    [DEBUG] Embeddings shapes: e_o={e_o.shape}, e_m={e_m.shape}")
 
-                # convert to probabilities
-                p_o = torch.sigmoid(scores_orig).item()
-                p_m = torch.sigmoid(scores_mask).item()
+            # tile and concat
+            B, D, E = e_o.shape
+            def tile(x): return x.unsqueeze(1).repeat(1, D, 1)
+            seqs_o.append(torch.cat([e_o, tile(e_micro), tile(e_biom), tile(e_other), tile(e_num)], dim=1))
+            seqs_m.append(torch.cat([e_m, tile(e_micro), tile(e_biom), tile(e_other), tile(e_num)], dim=1))
+        
+        total_len = seqs_o[0].shape[1] * len(seqs_o)
+        print(f"  [DEBUG] Queued sequences for {pid}/{region}, total seq length per: {total_len}")
 
-                # both logit‐ and prob‐level deltas
-                logit_o, logit_m = scores_orig.item(), scores_mask.item()
-                delta_logits = logit_o - logit_m
-                delta_probs  = p_o    - p_m
+        seq_pairs.append((
+            torch.cat(seqs_o, dim=1),
+            torch.cat(seqs_m, dim=1),
+            (pid, region)
+        ))
 
+    # 4) batch through attention head
+    def collate_fn(batch):
+        so = torch.cat([b[0] for b in batch], dim=0)
+        sm = torch.cat([b[1] for b in batch], dim=0)
+        metas = [b[2] for b in batch]
+        return so, sm, metas
+
+    loader = DataLoader(seq_pairs, batch_size=4, collate_fn=collate_fn)
+    print(f"[DEBUG] Running attention on {len(loader)} batches (batch_size=4)")
+    results = []
+    for i, (so, sm, metas) in enumerate(loader, 1):
+        print(f"[DEBUG] Batch {i}/{len(loader)}: so={so.shape}, sm={sm.shape}")
+        so, sm = so.to(device), sm.to(device)
+        with torch.no_grad():
+            lo = full_model.attn(so).mean(dim=1)
+            lm = full_model.attn(sm).mean(dim=1)
+
+        for idx, (pid, region) in enumerate(metas):
+            l_o, l_m = lo[idx].item(), lm[idx].item()
+            p_o, p_m = torch.sigmoid(lo[idx]).item(), torch.sigmoid(lm[idx]).item()
             results.append({
-                "Patient":     pid,
-                "Region":      region,
-                "Logit_orig":  logit_o,
-                "Logit_mask":  logit_m,
-                "Delta":       delta_logits,
-                "Prob_orig":   p_o,
-                "Prob_mask":   p_m,
-                "Delta_prob":  delta_probs
+                "Patient":    pid,
+                "Region":     region,
+                "Logit_orig": l_o,
+                "Logit_mask": l_m,
+                "Delta":      l_o - l_m,
+                "Prob_orig":  p_o,
+                "Prob_mask":  p_m,
+                "Delta_prob": p_o - p_m
             })
 
-
-    df = pd.DataFrame(results, columns=["Patient","Region","Logit_orig","Logit_mask","Delta"])
-    print(f"[INFO] Multi‐TP region‐impact done in {time.time()-start:.1f}s; {len(df)} entries.")
+    df = pd.DataFrame(results)
+    print(f"[INFO] Completed in {time.time()-start:.1f}s — {len(df)} entries.")
     return df
+
 
 
 class MaskedMultiTimeDataset(Dataset):
@@ -874,147 +1032,306 @@ class MaskedMultiTimeDataset(Dataset):
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
-    
+
+# 1) Precompute embeddings once
+def precompute_embeddings(mri_dict, mri_encoder, out_dir, device):
+    os.makedirs(out_dir, exist_ok=True)
+    mri_encoder.eval()
+    for (pid, tp), mri in mri_dict.items():
+        emb_path = os.path.join(out_dir, f"{pid}_{tp}.pt")
+        if os.path.exists(emb_path):
+            continue
+        with torch.no_grad():
+            # mri: FloatTensor [1,H,W,D]
+            e_mri = mri_encoder(mri.unsqueeze(0).to(device))  # → (1, D, E)
+        torch.save(e_mri.squeeze(0).cpu(), emb_path)
+        print(f"[DEBUG] Saved embedding: {emb_path}")
+
+def load_precomputed(mri_keys, emb_dir):
+    mri_emb = {}
+    for pid, tp in mri_keys:
+        path = os.path.join(emb_dir, f"{pid}_{tp}.pt")
+        mri_emb[(pid, tp)] = torch.load(path)
+    return mri_emb
+
+
+
+def precompute_masked_mri(masked_paths, cache_dir, device="cpu"):
+    """
+    masked_paths: dict[(pid,tp,region)] -> either filepath or loader()
+    cache_dir:     path where to save .pt files
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    for (pid, tp, region), loader in masked_paths.items():
+        cache_fn = f"{pid}_{tp}_{region}.pt"
+        cache_path = os.path.join(cache_dir, cache_fn)
+        if os.path.exists(cache_path):
+            continue
+
+        # load raw NIfTI (unzipping if needed)
+        if callable(loader):
+            with loader() as f:
+                raw = f.read()
+            with tempfile.NamedTemporaryFile(suffix=".nii") as tmp:
+                tmp.write(raw); tmp.flush()
+                arr = nib.load(tmp.name).get_fdata()
+        else:
+            arr = nib.load(loader).get_fdata()
+
+        # same preprocessing as load_mri_data
+        if arr.ndim == 4 and arr.shape[-1] == 1:
+            arr = np.squeeze(arr, axis=-1)
+        mean, std = arr.mean(), arr.std()
+        norm = (arr - mean) / (std + 1e-8)
+
+        tensor = torch.from_numpy(norm.astype(np.float32)).unsqueeze(0).to(device)
+        torch.save(tensor.cpu(), cache_path)
+        print(f"[CACHE] Saved masked MRI: {cache_path}")
+
 def main():
     import numpy as np
     import pandas as pd
-
-    mask_root = "/home/tmnthc/result"
-
+    import os
+    import torch
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data.distributed import DistributedSampler
     from torch.utils.data import DataLoader
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ─── WANDB SETUP ─────────────────────────────────────────────────────────
+    wandb.init(
+        project="brain-region-prediction",
+        config={
+            "batch_size":64,
+            "embed_dim": 32,
+            "neg_frac": 50,
+            "pos_repeat":50,
+            "lr_clip": 1e-3,
+            "lr_proj": 5e-3,
+            "lr_num_heads": 1e-3,
+            "lr_mlp":  1e-3,
+            "epochs_pre": 700,
+            "patience_pre": 10,
+            "epochs_attn": 700,
+            "patience_attn": 3,
+            "ensemble_size":5,
+            "threshold": 0.5,
+            "num_layer": 3,
+            "drop_out":0.5,
+            "num_run":10
+        },
+    )
+    config = wandb.config
+    all_runs = []
 
-    # wrap in DataParallel—this will split each batch across GPUs [0..N-1]
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+
+    from torch.utils.data import DataLoader
     
-    print("Running on", device)
     scaler_pre = torch.cuda.amp.GradScaler()
     TIMEPOINTS = ["Baseline", "Washout", "Post"]
 
-
-    num_runs = 1
+    num_runs = config.num_run
     overall_accuracies = []
     test_accuracies = []
     shap_records = {mod: [] for mod in ["MRI", "Micro", "Biom", "Other", "Numeric"]}
 
+
+    # ─── DISTRIBUTED SETUP ──────────────────────────────────────────
+   
+
     for run in range(1, num_runs + 1):
         print(f"\n\n===== RUN {run}/{num_runs} =====")
+        wandb_run = wandb.init(
+            project="brain-region-prediction",
+            name=f"pretrain-run-{run}",
+            reinit=True,
+            config={
+                "run_index": run,
+                "num_runs": num_runs,
+                # you can also log hyperparams here, e.g. embed_dim, lr, etc.
+            }
+        )
 
-        # ---------------------
-        # Pretraining Phase w/ Early Stopping (no checkpointing)
-        # ---------------------
+
+
         data = load_data()
-        mri_dict = load_mri_data("/home/tmnthc/T1")
         all_patients = np.unique(data["Patient_ID"])
-
         if len(all_patients) < 19:
             raise ValueError("Need at least 19 patients for pretraining.")
+        
+        from sklearn.model_selection import train_test_split
 
-        # Pretraining split (this stays)
-        selected = np.random.choice(all_patients, size=23, replace=False)
-        train_ids = selected[:16]
-        val_ids   = selected[16:19]
-        test_ids  = selected[19:]
-        print("Using patient split for BOTH phases — Train:", train_ids,
-            "Val:", val_ids, "Test:", test_ids)
-        # last 4 for attention test only
+        # 0) Load the APOE4 labels once
+        other_df = pd.read_csv('/bmlfast/tom/New1/Other.csv')
+        other_df.rename(columns=lambda x: x.strip(), inplace=True)
+        other_df['Patient_ID'] = other_df['Patient_ID'].astype(str).str.strip()
+        patient_labels_df = other_df.groupby("Patient_ID")["APOE4"].max().reset_index()
+        patient_apoe4 = {
+            row["Patient_ID"]: int(row["APOE4"])
+            for _, row in patient_labels_df.iterrows()
+        }
 
-        print(f"\n===== RUN {run}/{num_runs} =====")
-        print("Shared split this run:")
-        print("  Train IDs:", train_ids)
-        print("  Val   IDs:", val_ids)
-        print("  Test  IDs:", test_ids)
-        train_pats_pre = train_ids
-        val_pats_pre   = val_ids
-        print("Pretraining - Train IDs:", train_pats_pre)
-        print("Pretraining - Val   IDs:", val_pats_pre)
+        all_patients = list(patient_apoe4.keys())
+        if len(all_patients) < 23:
+            raise ValueError("Need at least 23 unique patients for stratified splitting.")
+
+        # 1) Split off 4 patients for TEST, stratified by APOE4
+        trainval_ids, test_ids = train_test_split(
+            all_patients,
+            test_size=4,
+            stratify=[patient_apoe4[p] for p in all_patients],
+            random_state=42
+        )
+
+        # 2) From the remaining, split off 3 patients for VAL
+        train_ids, val_ids = train_test_split(
+            trainval_ids,
+            test_size=3,
+            stratify=[patient_apoe4[p] for p in trainval_ids],
+            random_state=42
+        )
+
+        print(f"Stratified split — Train: {train_ids}, Val: {val_ids}, Test: {test_ids}")
 
         train_data = (
-            data[data["Patient_ID"].isin(train_pats_pre)]
+            data[data["Patient_ID"].isin(train_ids)]
             .sort_values(["Patient_ID","Timepoint"])
             .groupby("Patient_ID").head(3)
             .reset_index(drop=True)
         )
         val_data = (
-            data[data["Patient_ID"].isin(val_pats_pre)]
+            data[data["Patient_ID"].isin(val_ids)]
             .sort_values(["Patient_ID","Timepoint"])
             .groupby("Patient_ID").head(3)
             .reset_index(drop=True)
         )
         print(f"Train rows: {len(train_data)}, Val rows: {len(val_data)}")
 
-        train_loader = DataLoader(
-            CombinedContrastiveDataset(train_data, mri_dict,
-                                       negative_sample_fraction=1,
-                                       positive_repeat=1,
-                                       augment=True),
-            batch_size=16, shuffle=True, collate_fn=custom_collate, num_workers=1, pin_memory=True,prefetch_factor=4)
-        
-        val_loader = DataLoader(
-            CombinedContrastiveDataset(val_data, mri_dict,
-                                       negative_sample_fraction=1,
-                                       positive_repeat=1,
-                                       augment=False),
-            batch_size=16, shuffle=False, collate_fn=custom_collate,  num_workers=1, pin_memory=True,prefetch_factor=4)
-        
-
-        micro_dim = train_data.filter(like='Microbiome_').shape[1]
-        biom_dim  = train_data.filter(like='Biomarker_').shape[1]
-        other_dim = train_data.filter(like='Other_').shape[1]
-        num_dim   = train_data.filter(like='mri_numeric_').shape[1]
+        # ────────────────────────────────────────────────────────────────────────
+        # 3) Instantiate & wrap your model with DataParallel
+        # ────────────────────────────────────────────────────────────────────────
+        micro_dim = train_data.filter(like="Microbiome_").shape[1]
+        biom_dim  = train_data.filter(like="Biomarker_").shape[1]
+        other_dim = train_data.filter(like="Other_").shape[1]
+        num_dim   = train_data.filter(like="mri_numeric_").shape[1]
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = MultiModalEmbeddingModel(
+        # After you choose your device:
+
+        print(f"[INFO] Assigned device: {device}")
+        model  = MultiModalEmbeddingModel(
             micro_dim, biom_dim, other_dim, num_dim,
             embed_dim=32, augment=True
         ).to(device)
+        model  = torch.nn.DataParallel(model)
+        print(f"[INFO] DataParallel is using device_ids = {model.device_ids}")
+        wandb.watch(model, log="all", log_freq=50)
 
-        optimizer = torch.optim.AdamW([
-            {'params': model.mri_encoder.clip_model.vision_model.encoder.parameters(), 'lr': 1e-4},
-            {'params': model.mri_encoder.project.parameters(),                 'lr': 5e-3},
-            {'params': model.micro_encoder.parameters(),                       'lr': 1e-3},
-            {'params': model.biom_encoder.parameters(),                        'lr': 1e-3},
-            {'params': model.other_encoder.parameters(),                       'lr': 1e-3},
-            {'params': model.numeric_encoder.parameters(),                     'lr': 1e-3},
-        ], weight_decay=1e-6)
+        # ────────────────────────────────────────────────────────────────────────
+        # 4) Precompute & cache CLIP embeddings once
+        # ────────────────────────────────────────────────────────────────────────
+        mri_cache = "/bmlfast/tom/mri_cache"
+        mri_dict  = load_mri_data(
+            root_dir="/bmlfast/tom/T1",
+            cache_dir=mri_cache,
+            device=device
+        )
 
-        total_epochs = 1
-        patience_pre = 15
-        best_pre_val_loss = float('inf')
-        epochs_no_improve_pre = 0
-        best_pre_state = None
-        val_loss_history = []
-
-        for ep in range(1, total_epochs + 1):
-            tr_loss = train_epoch(model, train_loader, optimizer, device,
-                                  epoch=ep,
-                                  val_loss_history=val_loss_history,
-                                  patience_threshold=patience_pre,  scaler=scaler_pre)
-            val_loss = validate_epoch(model, val_loader, device)
-            torch.cuda.empty_cache()
-            val_loss_history.append(val_loss)
-
-            if val_loss < best_pre_val_loss:
-                best_pre_val_loss = val_loss
-                epochs_no_improve_pre = 0
-                best_pre_state = model.state_dict()
-            else:
-                epochs_no_improve_pre += 1
-
-            print(f"Pretrain Epoch {ep}/{total_epochs} | Train Loss: {tr_loss:.4f} | Val Loss: {val_loss:.4f}")
-
-            if epochs_no_improve_pre >= patience_pre:
-                print(f"→ Early stop pretraining at epoch {ep}, best val loss {best_pre_val_loss:.4f}")
-                break
-
-        # reload best pretraining weights
-        if best_pre_state is not None:
-            model.load_state_dict(best_pre_state)
-
+        # ────────────────────────────────────────────────────────────────────────
+        # 5) Build Contrastive Datasets & Loaders (no DistributedSampler)
+        # ────────────────────────────────────────────────────────────────────────
        
 
+        # ────────────────────────────────────────────────────────────────────────
+        # 6) Optimizer, Scaler & Early-Stopping Setup
+        # ────────────────────────────────────────────────────────────────────────
+        optimizer     = torch.optim.AdamW([
+            {'params': model.module.mri_encoder.clip_model.vision_model.encoder.parameters(), 'lr': config.lr_clip},
+            {'params': model.module.mri_encoder.project.parameters(),                           'lr': config.lr_proj},
+            {'params': model.module.micro_encoder.parameters(),                                 'lr': config.lr_mlp},
+            {'params': model.module.biom_encoder.parameters(),                                  'lr': config.lr_mlp},
+            {'params': model.module.other_encoder.parameters(),                                 'lr': config.lr_mlp},
+            {'params': model.module.numeric_encoder.parameters(),                               'lr': config.lr_mlp},
+        ], weight_decay=4)
+        scaler_pre    = torch.cuda.amp.GradScaler()
+        total_epochs  = config.epochs_pre
+        patience_pre  = config.patience_pre
+        best_val_loss = float('inf')
+        no_improve    = 0
+        val_history   = []
+
+        train_dataset = CombinedContrastiveDataset(
+            train_data, mri_dict,
+            negative_sample_fraction=config.neg_frac,
+            positive_repeat=config.pos_repeat,
+            augment=True
+        )
+        val_dataset = CombinedContrastiveDataset(
+            val_data, mri_dict,
+            negative_sample_fraction=config.neg_frac,
+            positive_repeat=config.pos_repeat,
+            augment=False
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            collate_fn=custom_collate
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            collate_fn=custom_collate
+        )
         
-        # Attention Classification Phase
+
+        # ────────────────────────────────────────────────────────────────────────
+        # 7) Pretraining Loop
+        # ────────────────────────────────────────────────────────────────────────
+        for ep in range(1, total_epochs+1):
+            tr_loss = train_epoch(
+                model, train_loader, optimizer, device,
+                epoch=ep,
+                val_loss_history=val_history,
+                patience_threshold=patience_pre,
+                scaler=scaler_pre
+            )
+            
+            val_loss = validate_epoch(model, val_loader, device)
+            val_history.append(val_loss)
+            torch.cuda.empty_cache()
+
+            # Log to wandb
+            wandb.log({
+                "pretrain/train_loss": tr_loss,
+                "pretrain/val_loss":   val_loss,
+                "epoch":               ep
+            })
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                no_improve    = 0
+                best_state    = model.state_dict()
+            else:
+                no_improve += 1
+
+            print(f"Epoch {ep}/{total_epochs} | Train: {tr_loss:.4f} | Val: {val_loss:.4f}")
+            if no_improve >= patience_pre:
+                print(f"→ Early stop at epoch {ep}, best val {best_val_loss:.4f}")
+                break
+
+
+        # reload best pretraining weights
+        if best_val_loss < float('inf'):
+            model.load_state_dict(best_state)
+            
         # ---------------------
         # Attention Classification Phase
         # ---------------------
@@ -1022,7 +1339,7 @@ def main():
         from torch.utils.data import DataLoader
 
         # 1) Prepare patient‐level labels (APOE4)
-        other_df = pd.read_csv('/home/tmnthc/New1/Other.csv')
+        other_df = pd.read_csv('/bmlfast/tom/New1/Other.csv')
         other_df.rename(columns=lambda x: x.strip(), inplace=True)
         other_df['Patient_ID'] = other_df['Patient_ID'].astype(str).str.strip()
         other_df['Timepoint']  = other_df['Timepoint'].astype(str).str.strip()
@@ -1038,14 +1355,14 @@ def main():
 
         # 3) Train one or more attention heads
         ensemble_models = []
-        ensemble_size = 1
-        max_epochs     = 2
-        early_stop_pat = 5
+        ensemble_size = config.ensemble_size
+        max_epochs     = config.epochs_attn
+        early_stop_pat = config.patience_attn
 
         for ens in range(ensemble_size):
             # a) instantiate your classifier
             attn_model = StackedAttentionClassifier(
-                embed_dim=32, num_heads=4, num_layers=2, dropout=0.1
+                embed_dim=32, num_heads=4, num_layers=config.num_layer, dropout=config.drop_out, max_seq_len=5000 
             ).to(device)
 
             print("Attention Phase using same split — Train:", train_ids,
@@ -1056,12 +1373,20 @@ def main():
                 train_ids, data, mri_dict,
                 model, attn_model, device, patient_apoe4, TIMEPOINTS
             )
+            # … after you’ve constructed train_attn_ds …
+            # Gather all train labels (0 or 1)
+            all_train_labels = [lbl.item() for _, lbl in train_attn_ds]
+            N_pos = sum(all_train_labels)
+            N_neg = len(all_train_labels) - N_pos
+            # pos_weight is ratio of negatives to positives
+            pos_weight = torch.tensor([N_neg / N_pos], device=device)
+
             val_attn_ds = AttentionDatasetWithLabels(
                 val_ids, data, mri_dict,
                 model, attn_model, device, patient_apoe4, TIMEPOINTS
             )
             train_attn_loader = DataLoader(
-                train_attn_ds, batch_size=16, shuffle=True,
+                train_attn_ds, batch_size=64, shuffle=True,
                 collate_fn=attn_collate_with_labels
             )
 
@@ -1076,21 +1401,21 @@ def main():
             )
             test_attn_loader = DataLoader(
                 test_attn_dataset,
-                batch_size=16,      # or whatever batch size you used for train/val
+                batch_size=64,      # or whatever batch size you used for train/val
                 shuffle=False,
                 collate_fn=attn_collate_with_labels
             )
 
             val_attn_loader = DataLoader(
-                val_attn_ds, batch_size=16, shuffle=False,
+                val_attn_ds, batch_size=64, shuffle=False,
                 collate_fn=attn_collate_with_labels
             )
 
             # c) optimizer + loss
             optimizer_attn = torch.optim.Adam(
-                attn_model.parameters(), lr=1e-3, weight_decay=1e-4
+                attn_model.parameters(), lr=5e-4, weight_decay=1e-3
             )
-            criterion_attn = torch.nn.BCEWithLogitsLoss()
+            criterion_attn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
             best_val_loss   = float('inf')
             epochs_no_improve = 0
@@ -1103,9 +1428,11 @@ def main():
                 total_tr = 0.0
                 for emb, lbl in train_attn_loader:
                     emb, lbl = emb.to(device), lbl.to(device)
+                    noise_std = 0.05
+                    emb = emb + torch.randn_like(emb) * noise_std
                     optimizer_attn.zero_grad()
                     with torch.cuda.amp.autocast():
-                        logits = attn_model(emb).mean(dim=1)
+                        logits = attn_model(emb)
                         loss   = criterion_attn(logits, lbl)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(attn_model.parameters(), 1.0)
@@ -1119,7 +1446,7 @@ def main():
                 with torch.no_grad():
                     for emb, lbl in val_attn_loader:
                         emb, lbl = emb.to(device), lbl.to(device)
-                        logits = attn_model(emb).mean(dim=1)
+                        logits = attn_model(emb)
                         total_val += criterion_attn(logits, lbl).item() * emb.size(0)
                 val_loss = total_val / len(val_attn_ds)
 
@@ -1132,10 +1459,18 @@ def main():
                     epochs_no_improve += 1
 
                 if epoch == 1 or epoch % 5 == 0:
-                    print(f"Head {ens+1}, Epoch {epoch:3d} | Train {train_loss:.4f} | Val {val_loss:.4f}")
+                    print(f"Attention Head {ens+1}, Epoch {epoch:3d} | Train {train_loss:.4f} | Val {val_loss:.4f}")
                 if epochs_no_improve >= early_stop_pat:
                     print(f"→ Early stopping head {ens+1} at epoch {epoch}")
                     break
+
+                wandb.log({
+                    f"attn/head{ens+1}_train_loss": train_loss,
+                    f"attn/head{ens+1}_val_loss":   val_loss,
+                    "epoch_attn":                   epoch,
+                    "head":                         ens+1
+                })
+
 
             # reload best weights, add to ensemble
             if best_state is not None:
@@ -1151,187 +1486,285 @@ def main():
             all_patients, data, mri_dict,
             model, ensemble_models[0], device, patient_apoe4, TIMEPOINTS
         )
-        full_loader = DataLoader(full_attn_dataset, batch_size=16, shuffle=False, collate_fn=attn_collate_with_labels)
+        full_loader = DataLoader(full_attn_dataset, batch_size=64, shuffle=False, collate_fn=attn_collate_with_labels)
 
-        correct, total = 0, 0
-        with torch.no_grad():
-            for embeddings, labels in full_loader:
-                embeddings = embeddings.to(device)
-                labels     = labels.to(device)
-                logits = ensemble_models[0](embeddings).mean(dim=1)
-                preds  = (logits >= 0).float()
-                correct += (preds == labels).sum().item()
-                total   += labels.size(0)
-        print(f"Overall Accuracy: {100*correct/total:.2f}%")
 
-        # 6) Test accuracy
-        correct, total = 0, 0
-        with torch.no_grad():
-            for embeddings, labels in test_attn_loader:
-                embeddings = embeddings.to(device)
-                labels     = labels.to(device)
-                logits = ensemble_models[0](embeddings).mean(dim=1)
-                preds  = (logits >= 0).float()
-                correct += (preds == labels).sum().item()
-                total   += labels.size(0)
-        print(f"Test Accuracy:    {100*correct/total:.2f}%")
+        
 
-            # ─── Multi‐timepoint, per‐region masked evaluation ─────────────────────────
-        # build a dict for quick lookup
-        masked_paths = {
-            (pid, tp, region): path
-            for pid, tp, region, path in list_masked_paths(mask_root, TIMEPOINTS)
-        }
 
-        # collect all unique regions
-         # ─── REGION MASK IMPACT ANALYSIS (end-to-end with FullModel) ───────────────
- 
+        #     # ─── Multi‐timepoint, per‐region masked evaluation ─────────────────────────
+        # # build a dict for quick lookup
+        # mask_root = "/bmlfast/tom/result"
+   
+        # masked_cache = "/bmlfast/tom/masked_mri_cache"
 
-        # 1) wrap your trained models
-        full_model = FullModel(model, ensemble_models[0]).to(device)
-        full_model.eval()
 
-        # 2) build a lookup dict for every (pid,tp,region)
-        masked_paths = {
-            (pid, tp, region): path
-            for pid, tp, region, path in list_masked_paths(mask_root, TIMEPOINTS)
-        }
-        print(f"Found {len(masked_paths)} masked volumes total")
+        # # collect all unique regions
+        # # ─── REGION MASK IMPACT ANALYSIS (end-to-end with FullModel) ───────────────
 
-        # 3) call the new multi‐timepoint evaluator
-        df_impacts = evaluate_region_impacts_multi_timepoint(
-            full_model,
-            data,
-            mri_dict,
-            masked_paths,
-            TIMEPOINTS
-        )
 
-        if df_impacts.empty:
-            print("⚠️ No region impacts computed…")
-        else:
-            # After computing df_impacts…
-            # → Compute signed mean (optional)
-            signed_means = df_impacts.groupby("Region")["Delta"].mean()
-            # → Compute absolute mean deltas and sort descending
-            abs_means    = signed_means.abs().sort_values(ascending=False)
-            # → Build a summary DataFrame showing both signed & absolute
-            summary = pd.DataFrame({
-                "Region":       abs_means.index,
-                "MeanDelta":    signed_means.loc[abs_means.index].values,
-                "MeanAbsDelta": abs_means.values
-            })
-            print("Mean |Δ‐logit| by region (desc):")
-            print(summary)
-            # → Save by absolute importance
-            summary.to_csv(f"region_impacts_summary_run{run}.csv", index=False)
-
-                # ─────────────────────────────────────────────────────────────────────────
+        # # 1) wrap your trained models
+        # full_model = FullModel(model, ensemble_models[0]).to(device)
+        # full_model.eval()
 
        
+     
+        # data_df = load_data()
+        # mri_orig = load_mri_data(              # dict[(pid,tp)] → CPU tensor [1,H,W,D]
+        #     root_dir="/bmlfast/tom/T1",
+        #     cache_dir="/bmlfast/tom/mri_cache",
+        #     device=device
+        # )
+        # # 3) call the new multi‐timepoint evaluator
+        # df_impacts = evaluate_region_impacts_multi_timepoint(
+        #     full_model=full_model,      # your FullModel wrapper
+        #     data_df = data_df,            # the merged DataFrame
+        #     mri_orig = mri_orig,          # original MRIs loaded into memory
+        #     masked_cache_dir = masked_cache,  # the dict of mask loaders
+        #     timepoints=TIMEPOINTS,      # exactly 3 timepoints
+        # )
+
+        # # Save the raw per‐patient results
+        # raw_fname = f"region_impacts_details_run{run}.csv"
+        # df_impacts.to_csv(raw_fname, index=False)
+        # print(f"[INFO] Saved detailed per‐patient region impacts to {raw_fname}")
 
 
-        # overall accuracy on full dataset
-        total_correct_full = 0
-        total_samples_full = 0
+        # if df_impacts.empty:
+        #     print("⚠️ No region impacts computed…")
+        # else:
+        #     # 1) group raw logits and deltas by region
+        #     region_logit_orig = df_impacts.groupby("Region")["Logit_orig"].mean()
+        #     region_logit_mask = df_impacts.groupby("Region")["Logit_mask"].mean()
+        #     signed_delta      = df_impacts.groupby("Region")["Delta"].mean()
+
+        #     # 2) sort regions by absolute Δ‐logit descending
+        #     abs_delta        = signed_delta.abs().sort_values(ascending=False)
+        #     sorted_regions   = abs_delta.index
+
+        #     # 3) compute mean probabilities from mean logits
+        #     import numpy as np
+        #     mean_logit_orig = region_logit_orig.loc[sorted_regions].values
+        #     mean_logit_mask = region_logit_mask.loc[sorted_regions].values
+        #     mean_prob_orig  = 1 / (1 + np.exp(-mean_logit_orig))
+        #     mean_prob_mask  = 1 / (1 + np.exp(-mean_logit_mask))
+
+        #     # 4) build the summary DataFrame
+        #     summary = pd.DataFrame({
+        #         "Region":             sorted_regions,
+        #         "MeanLogit_orig":     mean_logit_orig,
+        #         "MeanProb_orig":      mean_prob_orig,
+        #         "MeanLogit_mask":     mean_logit_mask,
+        #         "MeanProb_mask":      mean_prob_mask,
+        #         "MeanDelta_logit":    signed_delta.loc[sorted_regions].values,
+        #         "MeanAbsDelta_logit": abs_delta.values
+        #     })
+
+        #     # 5) print & save
+        #     print("Region impact summary (sorted by |Δ‐logit|):")
+        #     print(summary)
+        #     summary.to_csv(f"region_impacts_summary_run{run}.csv", index=False)
+
+        val_probs  = []
+        val_labels = []
+        with torch.no_grad():
+            for emb, lbl in val_attn_loader:
+                emb       = emb.to(device)
+                lbl       = lbl.numpy()        # keep on CPU for sklearn
+                logits    = attn_model(emb)    # or ensemble average
+                probs_np  = torch.sigmoid(logits).cpu().numpy()
+                val_probs.append(probs_np)
+                val_labels.append(lbl)
+
+        val_probs  = np.concatenate(val_probs)   # shape (N_val,)
+        val_labels = np.concatenate(val_labels)  # shape (N_val,)
+
+        from sklearn.metrics import precision_recall_curve
+
+        # val_labels, val_probs already collected on your validation set
+        prec, rec, thr = precision_recall_curve(val_labels, val_probs)
+
+        # compute F1 for each threshold
+        f1_scores = 2 * prec * rec / (prec + rec + 1e-8)
+
+        # pick the threshold that maximizes F1
+        ix = np.nanargmax(f1_scores)
+        best_thresh = thr[ix]           # note: thr has length len(prec)-1
+        best_f1     = f1_scores[ix]
+
+        print(f"→ Best threshold: {best_thresh:.3f}, F1 = {best_f1:.3f}")
+
+
+        # ─── Overall accuracy (sigmoid + ensemble average) ─────────────────────────
+        total_correct = 0
+        total_samples = 0
+
         with torch.no_grad():
             for embeddings, labels in full_loader:
                 embeddings = embeddings.to(device)
-                labels = labels.to(device).float()
-                ensemble_logits = sum(m(embeddings) for m in ensemble_models) / len(ensemble_models)
-                logits_agg = ensemble_logits.mean(dim=1)
-                preds = (logits_agg >= 0).float()
-                total_correct_full += (preds == labels).sum().item()
-                total_samples_full += labels.size(0)
-        overall_acc = total_correct_full / total_samples_full if total_samples_full else 0.0
-        print(f"Run {run} Overall Accuracy: {overall_acc*100:.2f}%")
+                labels     = labels.to(device).float()
 
-        # test accuracy
+                # 1) ensemble-average logits
+                ensemble_logits = sum(m(embeddings) for m in ensemble_models) / len(ensemble_models)
+                # 2) convert to probabilities
+                probs = torch.sigmoid(ensemble_logits)
+                # 3) threshold at 0.5
+                preds = (probs >= 0.5).float()
+
+                total_correct += (preds == labels).sum().item()
+                total_samples += labels.size(0)
+
+        overall_acc = total_correct / total_samples if total_samples else 0.0
+        print(f"Overall Accuracy (prob ≥0.5): {overall_acc*100:.2f}%")
+
+   
         total_correct_test = 0
         total_samples_test = 0
+
         with torch.no_grad():
             for embeddings, labels in test_attn_loader:
                 embeddings = embeddings.to(device)
-                labels = labels.to(device).float()
+                labels     = labels.to(device).float()
+
+                # 1) ensemble-average logits
                 ensemble_logits = sum(m(embeddings) for m in ensemble_models) / len(ensemble_models)
-                logits_agg = ensemble_logits.mean(dim=1)
-                preds = (logits_agg >= 0).float()
+                # 2) convert to probabilities
+                probs = torch.sigmoid(ensemble_logits)
+                # 3) threshold at 0.5
+                preds = (probs >= config.threshold).float()
+
                 total_correct_test += (preds == labels).sum().item()
                 total_samples_test += labels.size(0)
-        trial_accuracy = total_correct_test / total_samples_test if total_samples_test else 0.0
-        print(f"Run {run} Test Accuracy:   {trial_accuracy*100:.2f}%")
 
-        # SHAP analysis
+        test_acc = total_correct_test / total_samples_test if total_samples_test else 0.0
+        print(f"Run {run} Test Accuracy (prob ≥{config.threshold}): {test_acc*100:.2f}%")
 
-        attn_model = ensemble_models[0]
+        run_records = []
+        with torch.no_grad():
+            for pid, (emb, label) in zip(test_ids, test_attn_dataset):
+                emb = emb.unsqueeze(0).to(device)               # (1, T, E)
+                # ensemble‐average logits → prob
+                logits = sum(m(emb) for m in ensemble_models) / len(ensemble_models)
+                prob   = torch.sigmoid(logits)[0].item()
+                pred   = 1.0 if prob >= config.threshold else 0.0
+
+                run_records.append({
+                    "Run":            run,
+                    "Patient_ID":     pid,
+                    "TrueLabel":      float(label.item()),
+                    "PredictedLabel": pred
+                })
+
+        all_runs.append(pd.DataFrame(run_records))
+
+        import os
+
+        os.makedirs("saved_models", exist_ok=True)
+        for idx, head in enumerate(ensemble_models, start=1):
+            path = f"saved_models/run_{run}_attn_head{idx}.pt"
+            torch.save(head.state_dict(), path)
+            print(f"[INFO] Saved attention head {idx} to {path}")
+
+        # (Optionally) Save the frozen embedding backbone too:
+        backbone_path = f"saved_models/run_{run}_embedding_backbone.pt"
+        torch.save(model.module.state_dict(), backbone_path)
+        print(f"[INFO] Saved embedding backbone to {backbone_path}")
+
+
+
+        # # wandb.log({
+        # #     "overall_accuracy": overall_acc,
+        # #     "test_accuracy":    trial_accuracy,
+        # #     **{f"shap/{mod}": np.mean(vals) for mod, vals in shap_records.items()}ls
+
+        # # })
+
+        # # SHAP analysis
+
+        # attn_model = ensemble_models[0]
+
+        
+        #     # ─── MODALITY‑LEVEL SHAP ANALYSIS (KernelExplainer with wrapper) ─────────────
+        # if len(train_attn_ds) > 0:
+        #     # 1) Grab a single sample embedding
+        #     sample_embedding, _ = train_attn_ds[0]   # (T, E)
+        #     T, E = sample_embedding.shape            # T = total tokens, E = embed_dim
+
+        #     # 2) Flatten to (T*E,) and prepare device & model
+        #     sample_input_flat = sample_embedding.view(-1).cpu().numpy()
+        #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #     attn_model = ensemble_models[0].to(device).eval()
+
+        #     # 3) Define the SHAP wrapper
+        #     def attention_classifier_wrapper(X: np.ndarray) -> np.ndarray:
+        #         """
+        #         X: shape (B, T*E)
+        #         Returns: shape (B,) of scalar logits from the attention classifier
+        #         """
+        #         X_torch = torch.from_numpy(X).float().to(device)   # (B, T*E)
+        #         B = X_torch.size(0)
+        #         X_torch = X_torch.view(B, T, E)                   # (B, T, E)
+        #         with torch.no_grad():
+        #             logits = attn_model(X_torch)                  # (B,)
+        #         return logits.cpu().numpy()                       # (B,)
+
+        #     # 4) Baseline for Kernel SHAP
+        #     baseline = np.zeros((1, T * E), dtype=np.float32)
+
+        #     # 5) Build explainer & compute SHAP values
+        #     explainer   = shap.KernelExplainer(attention_classifier_wrapper, baseline)
+        #     shap_vals   = explainer.shap_values(
+        #         np.expand_dims(sample_input_flat, axis=0),     # (1, T*E)
+        #         nsamples=1000
+        #     )[0]  # (T*E,)
+
+        #     # 6) Split into modality blocks and sum absolute SHAP scores
+        #     D = T // 5
+        #     modality_slices = {
+        #         "MRI":     slice(0 * D * E, 1 * D * E),
+        #         "Micro":   slice(1 * D * E, 2 * D * E),
+        #         "Biom":    slice(2 * D * E, 3 * D * E),
+        #         "Other":   slice(3 * D * E, 4 * D * E),
+        #         "Numeric": slice(4 * D * E, 5 * D * E),
+        #     }
+
+        #     print("\nModality‑level SHAP importance (KernelExplainer):")
+        #     for mod, sl in modality_slices.items():
+        #         importance = np.sum(np.abs(shap_vals[sl]))
+        #         print(f"  {mod}: {importance:.4f}")
+        #         shap_records[mod].append(importance)
 
     
-       
+        #      # ─── MODALITY‐LEVEL SHAP ANALYSIS ─────────────────────────────────────
+        
 
-        if len(train_attn_ds) > 0:
-            # Pick your explainer model (first ensemble member)
-            attn_model_for_shap = ensemble_models[0].eval()
-
-            # Grab a single sample to get T and E
-            sample_embedding, _ = train_attn_ds[0]   # shape (T, E)
-            sample_input_flat = sample_embedding.view(-1).cpu().numpy()
-
-            T, E = sample_embedding.shape  
-            baseline = np.zeros((1, T * E), dtype=np.float32)
-
-            def attention_wrapper(X):
-                # make X_t float32 to match your model’s parameters
-                X_t = torch.from_numpy(X).float().to(device)
-                B = X_t.shape[0]
-                X_t = X_t.view(B, T, E)
-                with torch.no_grad():
-                    logits = attn_model_for_shap(X_t)
-                return logits.mean(dim=1).cpu().numpy()
-
-
-            explainer    = shap.KernelExplainer(attention_wrapper, baseline)
-            shap_values  = explainer.shap_values(
-                np.expand_dims(sample_input_flat, axis=0),
-                nsamples=1000
-            )[0]
-
-            # now split into five equal blocks of size rep*E
-            rep       = T // 5
-            block     = rep * E
-
-            modality_indices = {
-                "MRI":     slice(0*block,   1*block),
-                "Micro":   slice(1*block,   2*block),
-                "Biom":    slice(2*block,   3*block),
-                "Other":   slice(3*block,   4*block),
-                "Numeric": slice(4*block,   5*block),
-            }
-
-            print("Modality‐level SHAP importances:")
-            for mod, sl in modality_indices.items():
-                val = np.sum(np.abs(shap_values[sl]))
-                print(f"  {mod}: {val:.4f}")
-                shap_records[mod].append(val)
-
-            overall_accuracies.append(overall_acc)
-            test_accuracies.append(trial_accuracy)
+        overall_accuracies.append(overall_acc)
+        test_accuracies.append(test_acc)
 
     # summary
     # ===== SUMMARY OVER 20 RUNS =====
-    print("\n\n===== SUMMARY OVER 20 RUNS =====")
-    for i in range(num_runs):
-        ov = overall_accuracies[i] * 100
-        te = test_accuracies[i] * 100
-        mri_sh = shap_records["MRI"][i]
-        mic_sh = shap_records["Micro"][i]
-        bio_sh = shap_records["Biom"][i]
-        oth_sh = shap_records["Other"][i]
-        num_sh = shap_records["Numeric"][i]
-    print(
-        f"Run {i+1:2d}: Overall={ov:5.2f}%   Test={te:5.2f}%   "
-        f"SHAP(MRI={mri_sh:.4f}, Micro={mic_sh:.4f}, Biom={bio_sh:.4f}, "
-        f"Other={oth_sh:.4f}, Numeric={num_sh:.4f})"
-    )
+
+        # 3) Concatenate all runs and save once
+    df_all = pd.concat(all_runs, ignore_index=True)
+    out_path = "all_runs_predictions.csv"
+    df_all.to_csv(out_path, index=False)
+    print(f"[INFO] Saved all‐runs predictions to {out_path}")
+    print(df_all)
+
+    # print("\n\n===== SUMMARY OVER 20 RUNS =====")
+    # for i in range(num_runs):
+    #     ov = overall_accuracies[i] * 100
+    #     te = test_accuracies[i] * 100
+    #     mri_sh = shap_records["MRI"][i]
+    #     mic_sh = shap_records["Micro"][i]
+    #     bio_sh = shap_records["Biom"][i]
+    #     oth_sh = shap_records["Other"][i]
+    #     num_sh = shap_records["Numeric"][i]
+    # print(
+    #     f"Run {i+1:2d}: Overall={ov:5.2f}%   Test={te:5.2f}%   "
+    #     f"SHAP(MRI={mri_sh:.4f}, Micro={mic_sh:.4f}, Biom={bio_sh:.4f}, "
+    #     f"Other={oth_sh:.4f}, Numeric={num_sh:.4f})"
+    # )
 
     # compute means and std devs
     import numpy as np
