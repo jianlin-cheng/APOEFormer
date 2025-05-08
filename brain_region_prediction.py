@@ -1104,8 +1104,8 @@ def main():
         config={
             "batch_size":64,
             "embed_dim": 32,
-            "neg_frac": 50,
-            "pos_repeat":50,
+            "neg_frac": 200,
+            "pos_repeat":200,
             "lr_clip": 1e-3,
             "lr_proj": 5e-3,
             "lr_num_heads": 1e-3,
@@ -1181,7 +1181,7 @@ def main():
             all_patients,
             test_size=4,
             stratify=[patient_apoe4[p] for p in all_patients],
-            random_state=42
+            random_state=run
         )
 
         # 2) From the remaining, split off 3 patients for VAL
@@ -1189,7 +1189,7 @@ def main():
             trainval_ids,
             test_size=3,
             stratify=[patient_apoe4[p] for p in trainval_ids],
-            random_state=42
+            random_state=run
         )
 
         print(f"Stratified split — Train: {train_ids}, Val: {val_ids}, Test: {test_ids}")
@@ -1774,10 +1774,10 @@ def main():
     print(f"\nAverage Overall Accuracy: {avg_ov:.2f}% (±{std_ov:.2f}%)")
     print(f"Average Test    Accuracy: {avg_te:.2f}% (±{std_te:.2f}%)\n")
 
-    print("Average SHAP importances per modality (±std):")
-    for mod, vals in shap_records.items():
-        m, s = np.mean(vals), np.std(vals)
-        print(f"  {mod}: {m:.4f} (±{s:.4f})")
+    # print("Average SHAP importances per modality (±std):")
+    # for mod, vals in shap_records.items():
+    #     m, s = np.mean(vals), np.std(vals)
+    #     print(f"  {mod}: {m:.4f} (±{s:.4f})")
 
 if __name__ == "__main__":
     main()
