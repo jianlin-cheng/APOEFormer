@@ -1104,12 +1104,12 @@ def main():
         config={
             "batch_size":64,
             "embed_dim": 32,
-            "neg_frac": 200,
-            "pos_repeat":200,
-            "lr_clip": 1e-3,
-            "lr_proj": 5e-3,
-            "lr_num_heads": 1e-3,
-            "lr_mlp":  1e-3,
+            "neg_frac": 100,
+            "pos_repeat":1,
+            "lr_clip": 4e-3,
+            "lr_proj": 5e-3, 
+            "lr_num_heads": 4e-3,
+            "lr_mlp":  4e-3,
             "epochs_pre": 700,
             "patience_pre": 10,
             "epochs_attn": 700,
@@ -1117,7 +1117,7 @@ def main():
             "ensemble_size":5,
             "threshold": 0.5,
             "num_layer": 3,
-            "drop_out":0.5,
+            "drop_out":0.3,
             "num_run":10
         },
     )
@@ -1187,7 +1187,7 @@ def main():
         # 2) From the remaining, split off 3 patients for VAL
         train_ids, val_ids = train_test_split(
             trainval_ids,
-            test_size=3,
+            test_size=2,
             stratify=[patient_apoe4[p] for p in trainval_ids],
             random_state=run
         )
@@ -1412,8 +1412,8 @@ def main():
             )
 
             # c) optimizer + loss
-            optimizer_attn = torch.optim.Adam(
-                attn_model.parameters(), lr=5e-4, weight_decay=1e-3
+            optimizer_attn = torch.optim.AdamW(
+                attn_model.parameters(), lr=4e-4, weight_decay=4e-3
             )
             criterion_attn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -1657,18 +1657,18 @@ def main():
 
         all_runs.append(pd.DataFrame(run_records))
 
-        import os
+        # import os
 
-        os.makedirs("saved_models", exist_ok=True)
-        for idx, head in enumerate(ensemble_models, start=1):
-            path = f"saved_models/run_{run}_attn_head{idx}.pt"
-            torch.save(head.state_dict(), path)
-            print(f"[INFO] Saved attention head {idx} to {path}")
+        # os.makedirs("saved_models", exist_ok=True)
+        # for idx, head in enumerate(ensemble_models, start=1):
+        #     path = f"saved_models/run_{run}_attn_head{idx}.pt"
+        #     torch.save(head.state_dict(), path)
+        #     print(f"[INFO] Saved attention head {idx} to {path}")
 
-        # (Optionally) Save the frozen embedding backbone too:
-        backbone_path = f"saved_models/run_{run}_embedding_backbone.pt"
-        torch.save(model.module.state_dict(), backbone_path)
-        print(f"[INFO] Saved embedding backbone to {backbone_path}")
+        # # (Optionally) Save the frozen embedding backbone too:
+        # backbone_path = f"saved_models/run_{run}_embedding_backbone.pt"
+        # torch.save(model.module.state_dict(), backbone_path)
+        # print(f"[INFO] Saved embedding backbone to {backbone_path}")
 
 
 
@@ -1681,58 +1681,61 @@ def main():
 
         # # SHAP analysis
 
-        # attn_model = ensemble_models[0]
+        import numpy as np
+        import shap
+        import torch
 
-        
-        #     # ─── MODALITY‑LEVEL SHAP ANALYSIS (KernelExplainer with wrapper) ─────────────
-        # if len(train_attn_ds) > 0:
-        #     # 1) Grab a single sample embedding
-        #     sample_embedding, _ = train_attn_ds[0]   # (T, E)
-        #     T, E = sample_embedding.shape            # T = total tokens, E = embed_dim
+        # assuming train_attn_ds is your AttentionDatasetWithLabels
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        attn_model = ensemble_models[0].to(device).eval()
 
-        #     # 2) Flatten to (T*E,) and prepare device & model
-        #     sample_input_flat = sample_embedding.view(-1).cpu().numpy()
-        #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        #     attn_model = ensemble_models[0].to(device).eval()
+        # Prepare the slices once
+        T, E = train_attn_ds[0][0].shape
+        D    = T // 5
+        modality_slices = {
+            "MRI":     slice(0 * D * E, 1 * D * E),
+            "Micro":   slice(1 * D * E, 2 * D * E),
+            "Biom":    slice(2 * D * E, 3 * D * E),
+            "Other":   slice(3 * D * E, 4 * D * E),
+            "Numeric": slice(4 * D * E, 5 * D * E),
+        }
 
-        #     # 3) Define the SHAP wrapper
-        #     def attention_classifier_wrapper(X: np.ndarray) -> np.ndarray:
-        #         """
-        #         X: shape (B, T*E)
-        #         Returns: shape (B,) of scalar logits from the attention classifier
-        #         """
-        #         X_torch = torch.from_numpy(X).float().to(device)   # (B, T*E)
-        #         B = X_torch.size(0)
-        #         X_torch = X_torch.view(B, T, E)                   # (B, T, E)
-        #         with torch.no_grad():
-        #             logits = attn_model(X_torch)                  # (B,)
-        #         return logits.cpu().numpy()                       # (B,)
+        # initialize records
+        shap_records = {mod: [] for mod in modality_slices}
 
-        #     # 4) Baseline for Kernel SHAP
-        #     baseline = np.zeros((1, T * E), dtype=np.float32)
+        # baseline for Kernel SHAP
+        baseline = np.zeros((1, T * E), dtype=np.float32)
 
-        #     # 5) Build explainer & compute SHAP values
-        #     explainer   = shap.KernelExplainer(attention_classifier_wrapper, baseline)
-        #     shap_vals   = explainer.shap_values(
-        #         np.expand_dims(sample_input_flat, axis=0),     # (1, T*E)
-        #         nsamples=1000
-        #     )[0]  # (T*E,)
+        # define wrapper once
+        def attention_classifier_wrapper(X: np.ndarray) -> np.ndarray:
+            X_t = torch.from_numpy(X).float().to(device)      # (B, T*E)
+            B   = X_t.size(0)
+            X_t = X_t.view(B, T, E)                          # (B, T, E)
+            with torch.no_grad():
+                logits = attn_model(X_t)                     # (B,)
+            return logits.cpu().numpy()                      # (B,)
 
-        #     # 6) Split into modality blocks and sum absolute SHAP scores
-        #     D = T // 5
-        #     modality_slices = {
-        #         "MRI":     slice(0 * D * E, 1 * D * E),
-        #         "Micro":   slice(1 * D * E, 2 * D * E),
-        #         "Biom":    slice(2 * D * E, 3 * D * E),
-        #         "Other":   slice(3 * D * E, 4 * D * E),
-        #         "Numeric": slice(4 * D * E, 5 * D * E),
-        #     }
+        # loop over all samples
+        for i, (sample_embedding, _) in enumerate(train_attn_ds):
+            # flatten
+            sample_flat = sample_embedding.view(-1).cpu().numpy()[None, :]  # shape (1, T*E)
 
-        #     print("\nModality‑level SHAP importance (KernelExplainer):")
-        #     for mod, sl in modality_slices.items():
-        #         importance = np.sum(np.abs(shap_vals[sl]))
-        #         print(f"  {mod}: {importance:.4f}")
-        #         shap_records[mod].append(importance)
+            # build explainer & compute shap values
+            explainer = shap.KernelExplainer(attention_classifier_wrapper, baseline)
+            shap_vals  = explainer.shap_values(sample_flat, nsamples=500)[0]  # (T*E,)
+
+            # sum absolute importance per modality
+            for mod, sl in modality_slices.items():
+                importance = np.abs(shap_vals[sl]).sum()
+                shap_records[mod].append(importance)
+
+            print(f"  → Computed SHAP for sample {i+1}/{len(train_attn_ds)}")
+
+        # Now shap_records[mod] is a list of importances, one per patient/sample
+        # You can average or inspect distributions:
+        for mod, vals in shap_records.items():
+            print(f"{mod} avg±std: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+
 
     
         #      # ─── MODALITY‐LEVEL SHAP ANALYSIS ─────────────────────────────────────
@@ -1751,20 +1754,20 @@ def main():
     print(f"[INFO] Saved all‐runs predictions to {out_path}")
     print(df_all)
 
-    # print("\n\n===== SUMMARY OVER 20 RUNS =====")
-    # for i in range(num_runs):
-    #     ov = overall_accuracies[i] * 100
-    #     te = test_accuracies[i] * 100
-    #     mri_sh = shap_records["MRI"][i]
-    #     mic_sh = shap_records["Micro"][i]
-    #     bio_sh = shap_records["Biom"][i]
-    #     oth_sh = shap_records["Other"][i]
-    #     num_sh = shap_records["Numeric"][i]
-    # print(
-    #     f"Run {i+1:2d}: Overall={ov:5.2f}%   Test={te:5.2f}%   "
-    #     f"SHAP(MRI={mri_sh:.4f}, Micro={mic_sh:.4f}, Biom={bio_sh:.4f}, "
-    #     f"Other={oth_sh:.4f}, Numeric={num_sh:.4f})"
-    # )
+    print("\n\n===== SUMMARY OVER 20 RUNS =====")
+    for i in range(num_runs):
+        ov = overall_accuracies[i] * 100
+        te = test_accuracies[i] * 100
+        mri_sh = shap_records["MRI"][i]
+        mic_sh = shap_records["Micro"][i]
+        bio_sh = shap_records["Biom"][i]
+        oth_sh = shap_records["Other"][i]
+        num_sh = shap_records["Numeric"][i]
+    print(
+        f"Run {i+1:2d}: Overall={ov:5.2f}%   Test={te:5.2f}%   "
+        f"SHAP(MRI={mri_sh:.4f}, Micro={mic_sh:.4f}, Biom={bio_sh:.4f}, "
+        f"Other={oth_sh:.4f}, Numeric={num_sh:.4f})"
+    )
 
     # compute means and std devs
     import numpy as np
@@ -1774,10 +1777,10 @@ def main():
     print(f"\nAverage Overall Accuracy: {avg_ov:.2f}% (±{std_ov:.2f}%)")
     print(f"Average Test    Accuracy: {avg_te:.2f}% (±{std_te:.2f}%)\n")
 
-    # print("Average SHAP importances per modality (±std):")
-    # for mod, vals in shap_records.items():
-    #     m, s = np.mean(vals), np.std(vals)
-    #     print(f"  {mod}: {m:.4f} (±{s:.4f})")
+    print("Average SHAP importances per modality (±std):")
+    for mod, vals in shap_records.items():
+        m, s = np.mean(vals), np.std(vals)
+        print(f"  {mod}: {m:.4f} (±{s:.4f})")
 
 if __name__ == "__main__":
     main()
