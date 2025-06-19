@@ -1143,7 +1143,7 @@ def main():
         config={
             "batch_size":64,
             "embed_dim": 64,
-            "neg_frac": 10,
+            "neg_frac": 20,
             "pos_repeat": 1,
             "lr_clip": 5e-3,
             "lr_proj": 5e-3,
@@ -1154,8 +1154,8 @@ def main():
             "patience_attn": 20,
             "ensemble_size":3,
             "threshold": 0.5,
-            "num_layer": 1,
-            "drop_out":0.3,
+            "num_layer": 2,
+            "drop_out":0.4,
             "num_run": 5
         },
     )
@@ -1348,7 +1348,10 @@ def main():
                                     dtype=torch.float32,
                                     device=device)
 
-            criterion_attn = nn.BCEWithLogitsLoss(pos_weight = pos_weight)
+            criterion_attn = nn.BCEWithLogitsLoss(
+                pos_weight=pos_weight,
+                reduction="mean"
+            )
             # ------------------------------------------------------------------
 
             # weighted sampler (unchanged – remains useful for variance reduction)
@@ -1376,7 +1379,7 @@ def main():
         
             optimizer_attn = torch.optim.AdamW(
                 [
-                    {"params": attn_model.parameters(),      "lr": 5e-4},
+                    {"params": attn_model.parameters(),      "lr": 1e-4},
                     
                 ],
                 weight_decay=5e-3
@@ -1399,6 +1402,10 @@ def main():
                             print(f"  ↳ [train] min/max prob: {probs.min().item():.4f}/{probs.max().item():.4f}")
                   
                         loss   = criterion_attn(logits, lbl)
+                        preds = (probs >= 0.5).float()
+                        train_acc = (preds == lbl).float().mean().item()
+                        print(f"  ↳ [train] Acc: {train_acc:.3f},  Prob-range: {probs.min():.3f}–{probs.max():.3f}")
+
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(attn_model.parameters(),1.0)
                     optimizer_attn.step()
