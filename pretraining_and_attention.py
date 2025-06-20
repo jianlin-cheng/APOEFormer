@@ -184,6 +184,7 @@ def load_mri_data(
                 emb = torch.load(path, map_location="cpu")  # (1,H,W,D) or (1,D,E)
                 mri_dict[(pid, tp)] = emb
                 total_cached += 1
+                print(f"[CACHE LOAD] {pid}_{tp}  ← {path}")    # ← print when loading
             except Exception as e:
                 print(f"⚠️ Failed to load cache {path}: {e}")
 
@@ -237,6 +238,7 @@ def load_mri_data(
                 os.makedirs(cache_dir, exist_ok=True)
                 cache_path = os.path.join(cache_dir, f"{pid}_{tp}.pt")
                 torch.save(tensor.cpu(), cache_path)
+                print(f"[CACHE SAVE] {pid}_{tp}  → {cache_path}")  # → print when saving
 
     if total_computed:
         print(f"[INFO] Computed & cached {total_computed} new MRI entries.")
@@ -275,6 +277,8 @@ class MRIClipEncoder(nn.Module):
             param.requires_grad = False
         self.unfreeze_layers = 6
         self._unfreeze_last_n_layers(self.unfreeze_layers)
+        for param in self.clip_model.vision_model.parameters():
+            param.requires_grad = True
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         self.project = nn.Sequential(
             nn.Linear(512, 64),
@@ -536,26 +540,38 @@ def patient_contrastive_loss(
     sample_labels,
     tau=0.1
 ):
-    B, E = e_mri.shape
-    labels_list = list(sample_labels)
-    all_labels  = labels_list * 8
-    _, inv     = np.unique(all_labels, return_inverse=True)
-    labels = torch.tensor(inv, device=e_mri.device)
+    """
+    e_*: (B, E) or (B,D,E) already pooled to (B,E)
+    sample_labels: torch.Tensor of shape (B,) on device
+    """
+    # 1) Build a (8*B, ) label tensor purely in PyTorch
+    B = sample_labels.size(0)
+    # ensure long dtype
+    labels = sample_labels.detach().long().to(e_mri.device)   # (B,)
+    labels_all = labels.repeat(8)                            # (8*B,)
 
+    # 2) Concatenate all embeddings: (8*B, E)
     emb_all = torch.cat([
         e_mri, e_x, e_micro, e_bioA, e_bioB, e_bioC, e_other, e_num
-    ], dim=0)  # (8B, E)
+    ], dim=0)
 
+    # 3) Compute similarity matrix
     sim = torch.matmul(emb_all, emb_all.t()) / tau
-    N   = 8 * B
+    N   = labels_all.size(0)
     diag = torch.eye(N, dtype=torch.bool, device=sim.device)
 
+    # 4) exponentiate
     exp_sim = torch.exp(sim)
-    sum_pos = (exp_sim * ((labels.unsqueeze(0)==labels.unsqueeze(1)) & ~diag).float()).sum(dim=1)
+
+    # 5) positive and all (minus self) sums
+    pos_mask = (labels_all.unsqueeze(0) == labels_all.unsqueeze(1)) & ~diag
+    sum_pos = (exp_sim * pos_mask.float()).sum(dim=1)
     sum_all = (exp_sim * (~diag).float()).sum(dim=1)
 
+    # 6) contrastive loss
     loss = -torch.log((sum_pos + 1e-8) / (sum_all + 1e-8))
     return loss.mean()
+
 
 ###########################################
 # 7) MultiModalEmbeddingModel
@@ -598,6 +614,12 @@ class MultiModalEmbeddingModel(nn.Module):
         max_slices = 256
         # register a learnable weight per slice index for attention pooling
         self.slice_weights = nn.Parameter(torch.zeros(max_slices))
+        self.probe_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim//2, 1)
+        )
 
         # store embed_dim for downstream use
         self.embed_dim = embed_dim
@@ -651,6 +673,12 @@ def embed_and_pad(vol_list, encoder, device):
     return torch.stack(padded, dim=0)  # (B, D_max, E)
 
 
+from torch import amp
+import torch.nn.functional as F
+
+from torch import amp
+import torch.nn.functional as F
+
 def train_epoch(
     model,
     loader,
@@ -658,12 +686,14 @@ def train_epoch(
     device,
     epoch,
     val_loss_history,
+    ce_weight,
     patience_threshold=5,
     accum_steps=4,
     scaler=None
 ):
     """
-    One training epoch over contrastive batches.
+    One training epoch over contrastive batches, combining
+    contrastive loss + small BCE head on emri_m.
     """
     base = model.module if hasattr(model, "module") else model
     model.train()
@@ -671,51 +701,49 @@ def train_epoch(
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(loader):
-        # 1) embed & pad MRI and X volumes
+        # — embed & pad MRI and X volumes —
         e_mri = embed_and_pad(batch["mri"],   base.mri_encoder, device)  # (B, D, E)
         e_x   = embed_and_pad(batch["x_img"], base.x_encoder,   device)  # (B, D, E)
 
+        # — attention‐pool each modality —
+        alpha_mri = F.softmax(base.slice_weights[: e_mri.size(1)], dim=0)
+        emri_m    = (e_mri * alpha_mri[None,:,None]).sum(1)            # (B, E)
+        alpha_x   = F.softmax(base.slice_weights[: e_x.size(1)], dim=0)
+        ex_m      = (e_x * alpha_x[None,:,None]).sum(1)                # (B, E)
 
-        D_mri     = e_mri.size(1)
-        w_mri     = base.slice_weights[:D_mri]                # (D_mri,)
-        alpha_mri = F.softmax(w_mri, dim=0)                   # (D_mri,)
-        emri_m    = (e_mri * alpha_mri[None,:,None]).sum(1)   # (B, E)
+        # — static modalities to device —
+        micro   = batch["micro"].to(device)
+        bioA    = batch["biomarker_A"].to(device)
+        bioB    = batch["biomarker_B"].to(device)
+        bioC    = batch["biomarker_C"].to(device)
+        other   = batch["other"].to(device)
+        num     = batch["numeric"].to(device)
+        labels  = batch["label"].to(device)
 
-        # X-modality attention-pool
-        D_x       = e_x.size(1)
-        w_x       = base.slice_weights[:D_x]                  # (D_x,)
-        alpha_x   = F.softmax(w_x, dim=0)                     # (D_x,)
-        ex_m      = (e_x * alpha_x[None,:,None]).sum(1)       # (B, E)
-
-        # 2) load static modalities
-        micro = batch["micro"].to(device)
-        bioA  = batch["biomarker_A"].to(device)
-        bioB  = batch["biomarker_B"].to(device)
-        bioC  = batch["biomarker_C"].to(device)
-        other = batch["other"].to(device)
-        num   = batch["numeric"].to(device)
-        labels= batch["label"]
-
-        # 3) encode static via MLPs
-        e_micro = base.micro_encoder(micro)     # (B, E)
+        # — encode static —
+        e_micro = base.micro_encoder(micro)
         e_bioA  = base.bioA_encoder(bioA)
         e_bioB  = base.bioB_encoder(bioB)
         e_bioC  = base.bioC_encoder(bioC)
         e_other = base.other_encoder(other)
         e_num   = base.num_encoder(num)
 
-        ids   = torch.arange(emri_m.size(0), device=device)   # unique ID per sample
-
-        # 4) compute contrastive loss under autocast
+        # — compute losses under autocast —
         with amp.autocast(device_type="cuda"):
-            loss = patient_contrastive_loss(
+            # contrastive:
+            contr_loss = patient_contrastive_loss(
                 emri_m, ex_m,
                 e_micro, e_bioA, e_bioB, e_bioC, e_other, e_num,
                 sample_labels=labels,
                 tau=0.1
-            ) / accum_steps
+            )
+            # supervised BCE:
+            probe_logits = base.probe_head(emri_m).squeeze(-1)
+            ce_loss      = F.binary_cross_entropy_with_logits(probe_logits, labels)
+            # combine & average over accum steps
+            loss = (contr_loss + ce_weight * ce_loss) / accum_steps
 
-        # 5) backward + step
+        # — backward + optimizer step via scaler —
         scaler.scale(loss).backward()
         if (batch_idx + 1) % accum_steps == 0:
             scaler.unscale_(optimizer)
@@ -728,7 +756,7 @@ def train_epoch(
 
     avg_loss = total_loss / len(loader)
 
-    # dynamic unfreeze if no improvement
+    # optional dynamic unfreeze
     if val_loss_history and avg_loss >= max(val_loss_history[-patience_threshold:]):
         base.mri_encoder.gradually_unfreeze(patience_threshold, patience_threshold)
         base.x_encoder.gradually_unfreeze(patience_threshold, patience_threshold)
@@ -736,9 +764,9 @@ def train_epoch(
     return avg_loss
 
 
-def validate_epoch(model, loader, device):
+def validate_epoch(model, loader, device, ce_weight):
     """
-    One validation epoch over contrastive batches.
+    One validation epoch that mirrors train_epoch’s combined loss.
     """
     base = model.module if hasattr(model, "module") else model
     model.eval()
@@ -746,30 +774,26 @@ def validate_epoch(model, loader, device):
 
     with torch.no_grad():
         for batch in loader:
-             # 1) embed & pad MRI and X volumes
-            e_mri = embed_and_pad(batch["mri"],   base.mri_encoder, device)  # (B, D_mri, E)
-            e_x   = embed_and_pad(batch["x_img"], base.x_encoder,   device)  # (B, D_x,   E)
+            # embed & pad
+            e_mri = embed_and_pad(batch["mri"],   base.mri_encoder, device)
+            e_x   = embed_and_pad(batch["x_img"], base.x_encoder,   device)
 
-            # MRI attention‐pool
-            D_mri    = e_mri.size(1)
-            w_mri    = base.slice_weights[:D_mri]               # (D_mri,)
-            alpha_mri= F.softmax(w_mri, dim=0)                  # (D_mri,)
-            emri_m   = (e_mri * alpha_mri[None,:,None]).sum(1)  # (B, E)
+            # attention‐pool
+            alpha_mri = F.softmax(base.slice_weights[: e_mri.size(1)], dim=0)
+            emri_m    = (e_mri * alpha_mri[None,:,None]).sum(1)
+            alpha_x   = F.softmax(base.slice_weights[: e_x.size(1)], dim=0)
+            ex_m      = (e_x * alpha_x[None,:,None]).sum(1)
 
-            # X‐modality attention‐pool
-            D_x      = e_x.size(1)
-            w_x      = base.slice_weights[:D_x]                # (D_x,)
-            alpha_x  = F.softmax(w_x, dim=0)                   # (D_x,)
-            ex_m     = (e_x * alpha_x[None,:,None]).sum(1)     # (B, E)
+            # static → device
+            micro  = batch["micro"].to(device)
+            bioA   = batch["biomarker_A"].to(device)
+            bioB   = batch["biomarker_B"].to(device)
+            bioC   = batch["biomarker_C"].to(device)
+            other  = batch["other"].to(device)
+            num    = batch["numeric"].to(device)
+            labels = batch["label"].to(device)
 
-            micro = batch["micro"].to(device)
-            bioA  = batch["biomarker_A"].to(device)
-            bioB  = batch["biomarker_B"].to(device)
-            bioC  = batch["biomarker_C"].to(device)
-            other = batch["other"].to(device)
-            num   = batch["numeric"].to(device)
-            labels= batch["label"]
-
+            # encode static
             e_micro = base.micro_encoder(micro)
             e_bioA  = base.bioA_encoder(bioA)
             e_bioB  = base.bioB_encoder(bioB)
@@ -777,18 +801,20 @@ def validate_epoch(model, loader, device):
             e_other = base.other_encoder(other)
             e_num   = base.num_encoder(num)
 
-            loss = patient_contrastive_loss(
+            # compute combined loss
+            contr_loss = patient_contrastive_loss(
                 emri_m, ex_m,
                 e_micro, e_bioA, e_bioB, e_bioC, e_other, e_num,
                 sample_labels=labels,
                 tau=0.1
-
             )
+            probe_logits = base.probe_head(emri_m).squeeze(-1)
+            ce_loss      = F.binary_cross_entropy_with_logits(probe_logits, labels)
+            loss = contr_loss + ce_weight * ce_loss
+
             total_loss += loss.item()
 
     return total_loss / len(loader)
-
-
 
 ###########################################
 # 9) Stacked Multi-Head Attention Classifier
@@ -1022,7 +1048,7 @@ def precompute_embeddings(mri_dict, mri_encoder, out_dir, device):
             # mri: FloatTensor [1,H,W,D]
             e_mri = mri_encoder(mri.unsqueeze(0).to(device))  # → (1, D, E)
         torch.save(e_mri.squeeze(0).cpu(), emb_path)
-        print(f"[DEBUG] Saved embedding: {emb_path}")
+        # print(f"[DEBUG] Saved embedding: {emb_path}")
 
 def load_precomputed(mri_keys, emb_dir):
     mri_emb = {}
@@ -1126,6 +1152,77 @@ class FocalLoss(nn.Module):
             return loss
         
 from torch.utils.data import Dataset
+# at the top of your file
+
+class FocalLoss(nn.Module):
+    def __init__(self,
+                 init_alpha_pos: float = 0.8,
+                 init_alpha_neg: float = 0.2,
+                 gamma:         float = 4.0,
+                 reduction:     str   = "mean"):
+        """
+        A focal loss where the positive‐class weight (alpha_pos)
+        and negative-class weight (alpha_neg) are learned.
+
+        init_alpha_pos: starting weight for true-1 examples
+        init_alpha_neg: starting weight for true-0 examples
+        gamma:          focusing parameter
+        """
+        super().__init__()
+        # these two will now get gradients
+        self.alpha_pos = nn.Parameter(torch.tensor(init_alpha_pos, dtype=torch.float32))
+        self.alpha_neg = nn.Parameter(torch.tensor(init_alpha_neg, dtype=torch.float32))
+        self.gamma     = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B,) raw scores
+        targets: (B,) floats in {0.0,1.0}
+        """
+        # 1) standard BCE part
+        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")  # (B,)
+
+        # 2) probability of the true class
+        probs = torch.sigmoid(logits)  # (B,)
+        p_t = probs * targets + (1.0 - probs) * (1.0 - targets)  # (B,)
+
+        # 3) ensure alphas stay in (0,1)
+        alpha_pos = torch.sigmoid(self.alpha_pos)  # scalar ∈ (0,1)
+        alpha_neg = torch.sigmoid(self.alpha_neg)  # scalar ∈ (0,1)
+
+        # 4) pick the correct alpha per example
+        alpha_t = targets * alpha_pos + (1.0 - targets) * alpha_neg  # (B,)
+
+        # 5) focal modulation
+        mod_term = (1.0 - p_t) ** self.gamma  # (B,)
+
+        # 6) combined loss
+        loss = alpha_t * mod_term * ce_loss  # (B,)
+
+        # 7) reduction
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
+
+class SimpleHead(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim//2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(embed_dim//2, 1)
+        )
+    def forward(self, embs):
+        # embs: (B, T, E) or (B, E)
+        if embs.dim() == 3:
+            embs = embs.mean(dim=1)
+        return self.net(embs).squeeze(-1)
+
 
 def main():
     import os
@@ -1141,22 +1238,23 @@ def main():
     wandb.init(
         project="brain-region-prediction",
         config={
-            "batch_size":64,
+            "batch_size":128,
             "embed_dim": 64,
-            "neg_frac": 20,
+            "neg_frac": 30,
             "pos_repeat": 1,
             "lr_clip": 5e-3,
             "lr_proj": 5e-3,
             "lr_mlp":  5e-3,
-            "epochs_pre": 100,
+            "epochs_pre": 200,
             "patience_pre": 3,
             "epochs_attn": 700,
-            "patience_attn": 20,
+            "patience_attn": 10,
             "ensemble_size":3,
             "threshold": 0.5,
-            "num_layer": 2,
-            "drop_out":0.4,
-            "num_run": 5
+            "num_layer": 1,
+            "drop_out":0.3,
+            "num_run": 5,
+            "ce_weight": 0.05
         },
     )
     config = wandb.config
@@ -1227,32 +1325,80 @@ def main():
             embed_dim=config.embed_dim,
             augment=True
         )
+        model = torch.compile(model)
+
         model = torch.nn.DataParallel(model).to(device)
         wandb.watch(model, log="all")
 
-        # 4) Precompute & load CLIP embeddings for MRI + X
-        EMB_CACHE = "/bmlfast/tom/mri_cache_embed64"
-        keys = list(zip(data.Patient_ID, data.Timepoint))
-        mri_dict = load_precomputed(keys, EMB_CACHE)
 
-        X_ROOT = "/bmlfast/tom/Perfusion_images"
-        X_CACHE = "/bmlfast/tom/Perfusion_cache"
-        x_raw_dict = load_mri_data(X_ROOT, cache_dir=X_CACHE)
-        X_EMB_CACHE = "/bmlfast/tom/x_cache_embed64"
-        precompute_embeddings(x_raw_dict, model.module.x_encoder, X_EMB_CACHE, device)
-        x_dict = load_precomputed(keys, X_EMB_CACHE)
+        # ── at the top of main(), after you define your paths ──
+        MRI_ROOT   = "/bmlfast/tom/T1"      # wherever your raw MRI NIfTIs live
+        MRI_CACHE  = "/bmlfast/tom/mri_raw_cache"   # new cache for raw MRI tensors
 
-        # 5) Contrastive pretraining
+        X_ROOT     = "/bmlfast/tom/Perfusion_images"
+        X_CACHE    = "/bmlfast/tom/Perfusion_cache"
+
+        # ── then in your loading section ──
+        print("Loading MRI raw volumes (with cache)…")
+        mri_dict = load_mri_data(
+            root_dir=MRI_ROOT,
+            cache_dir=MRI_CACHE,
+            device=device,
+            allowed_timepoints=TIMEPOINTS
+        )
+
+        print("Loading X raw volumes (with cache)…")
+        x_dict = load_mri_data(
+            root_dir=X_ROOT,
+            cache_dir=X_CACHE,
+            device=device,
+            allowed_timepoints=TIMEPOINTS
+        )
+
+        EMB_MRI_CACHE = "/bmlfast/tom/mri_embed_cache"
+        EMB_X_CACHE = "/bmlfast/tom/x_embed_cache"
+
+        # 4) Reload them if you like, or just pass mri_dict/x_dict forward…
+        mri_dict = load_precomputed(list(zip(data.Patient_ID, data.Timepoint)), EMB_MRI_CACHE)
+        x_dict   = load_precomputed(list(zip(data.Patient_ID, data.Timepoint)), EMB_MRI_CACHE)
+ 
+        # build one big list of parameter groups
+        param_groups = []
+
+        # CLIP encoder + projection (two LR values) for both mri & x backbones
+        for enc, lr_clip, lr_proj in [
+            ("mri_encoder", config.lr_clip, config.lr_proj),
+            ("x_encoder",  config.lr_clip, config.lr_proj),
+        ]:
+            param_groups.append({
+                "params": getattr(model.module, enc).clip_model.vision_model.encoder.parameters(),
+                "lr":      lr_clip
+            })
+            param_groups.append({
+                "params": getattr(model.module, enc).project.parameters(),
+                "lr":      lr_proj
+            })
+
+        # static‐MLP encoders at mlp LR
+        for name in ("micro_encoder","bioA_encoder","bioB_encoder",
+                    "bioC_encoder","other_encoder","num_encoder"):
+            param_groups.append({
+                "params": getattr(model.module, name).parameters(),
+                "lr":      config.lr_mlp
+            })
+
+        # probe head too at mlp LR
+        param_groups.append({
+            "params": model.module.probe_head.parameters(),
+            "lr":      config.lr_mlp
+        })
+
+        # finally create tr
         optimizer = torch.optim.AdamW(
-            [p for enc in ("mri_encoder","x_encoder") for p in (
-                {"params": getattr(model.module,enc).clip_model.vision_model.encoder.parameters(), "lr":config.lr_clip},
-                {"params": getattr(model.module,enc).project.parameters(),                               "lr":config.lr_proj},
-            )] + [
-                {"params": getattr(model.module,name).parameters(), "lr":config.lr_mlp}
-                for name in ("micro_encoder","bioA_encoder","bioB_encoder","bioC_encoder","other_encoder","num_encoder")
-            ],
+            param_groups,
             weight_decay=4
         )
+
         scheduler_pre = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6
         )
@@ -1270,10 +1416,16 @@ def main():
             augment=False
         )
         train_loader = DataLoader(
-            train_ds, batch_size=config.batch_size,
-            shuffle=True, num_workers=8, pin_memory=True,
+            train_ds,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=8,            # or even 16 if your CPU has cores
+            pin_memory=True,
+            prefetch_factor=2,        # PyTorch ≥1.7
+            persistent_workers=True,  # keep workers alive between epochs
             collate_fn=custom_collate
         )
+
         val_loader = DataLoader(
             val_ds, batch_size=config.batch_size,
             shuffle=False, num_workers=8, pin_memory=True,
@@ -1284,11 +1436,19 @@ def main():
         val_history = []
         for pre_ep in range(1, config.epochs_pre+1):
             tr_loss = train_epoch(
-                model, train_loader, optimizer, device, pre_ep,
-                val_history, patience_threshold=config.patience_pre,
-                accum_steps=4, scaler=scaler_pre
+                model, train_loader, optimizer, device,
+                pre_ep, val_history,
+                config.ce_weight,              # pass this explicitly
+                patience_threshold=config.patience_pre,
+                accum_steps=4,
+                scaler=scaler_pre
             )
-            val_loss = validate_epoch(model, val_loader, device)
+
+            val_loss = validate_epoch(
+                model, val_loader, device,
+                config.ce_weight               # likewise here
+            )
+
             val_history.append(val_loss)
             scheduler_pre.step(val_loss)
             wandb.log({
@@ -1348,10 +1508,12 @@ def main():
                                     dtype=torch.float32,
                                     device=device)
 
-            criterion_attn = nn.BCEWithLogitsLoss(
-                pos_weight=pos_weight,
+            criterion_attn = FocalLoss(
+                init_alpha_pos=0.9,
+                init_alpha_neg=0.1,
+                gamma=1.0,
                 reduction="mean"
-            )
+            ).to(device)
             # ------------------------------------------------------------------
 
             # weighted sampler (unchanged – remains useful for variance reduction)
@@ -1361,22 +1523,19 @@ def main():
                                             num_samples=len(weights),
                                             replacement=True)
 
-
             train_attn_loader = DataLoader(
-                train_attn_ds, batch_size=64, sampler=sampler,
+                train_attn_ds, batch_size=64, shuffle=True,
                 collate_fn=attn_collate_with_labels
             )
             val_attn_loader = DataLoader(
-                val_attn_ds, batch_size=64, shuffle=False,
+                val_attn_ds, batch_size=64, shuffle=True,
                 collate_fn=attn_collate_with_labels
             )
             test_attn_loader = DataLoader(
                 test_attn_ds, batch_size=64, shuffle=False,
                 collate_fn=attn_collate_with_labels
             )
-
             # optimizer & loss
-        
             optimizer_attn = torch.optim.AdamW(
                 [
                     {"params": attn_model.parameters(),      "lr": 1e-4},
@@ -1390,26 +1549,43 @@ def main():
             for epoch in range(1, config.epochs_attn+1):
                 # train head
                 attn_model.train()
+                emb0, lbl0 = next(iter(train_attn_loader))
+                # print(" EMB mean/std:", emb0.mean().item(), emb0.std().item())
+                # print(" LABELs:", lbl0.unique(return_counts=True))
+
+                # then do one forward+loss (no backward)  
+                with torch.no_grad():
+                    logits0 = attn_model(emb0.to(device))
+                    loss0 = criterion_attn(logits0, lbl0.to(device))
+                # print(" INITIAL loss:", loss0.item())
+                scaler_attn = amp.GradScaler()
                 tr_sum = 0.0
                 for emb, lbl in train_attn_loader:
                     emb, lbl = emb.to(device), lbl.to(device)
-                    # emb = emb + torch.randn_like(emb)*0.1
                     optimizer_attn.zero_grad()
-                    with amp.autocast(device_type="cuda"):
-                        logits = attn_model(emb)
-                        with torch.no_grad():
-                            probs = torch.sigmoid(logits)
-                            print(f"  ↳ [train] min/max prob: {probs.min().item():.4f}/{probs.max().item():.4f}")
-                  
-                        loss   = criterion_attn(logits, lbl)
-                        preds = (probs >= 0.5).float()
-                        train_acc = (preds == lbl).float().mean().item()
-                        print(f"  ↳ [train] Acc: {train_acc:.3f},  Prob-range: {probs.min():.3f}–{probs.max():.3f}")
 
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(attn_model.parameters(),1.0)
-                    optimizer_attn.step()
-                    tr_sum += loss.item()*emb.size(0)
+                    # 1) forward under autocast
+                    with autocast():
+                        logits = attn_model(emb)
+                        probs = torch.sigmoid(logits)
+                        # if epoch == 1 or epoch % 5 == 0:
+                        #     print(f"  ↳ [train] min/max prob: {probs.min().item():.4f}/{probs.max().item():.4f}")
+                        loss   = criterion_attn(logits, lbl)
+                        preds  = (probs >= 0.5).float()
+                        train_acc = (preds == lbl).float().mean().item()
+                        # if epoch == 1 or epoch % 5 == 0:
+                        #     print(f"  ↳ [train] Acc: {train_acc:.3f},  Prob-range: {probs.min():.3f}–{probs.max():.3f}")
+                    # 2) backward + step via scaler_attn
+                    scaler_attn.scale(loss).backward()
+                    # remove any old loss.backward() here
+                    # 3) unscale & clip
+                    scaler_attn.unscale_(optimizer_attn)
+                    torch.nn.utils.clip_grad_norm_(attn_model.parameters(), 1.0)
+                    # 4) step & update scaler
+                    scaler_attn.step(optimizer_attn)
+                    scaler_attn.update()
+                    tr_sum += loss.item() * emb.size(0)
+
                 tr_loss = tr_sum / len(train_attn_ds)
 
                 # validate head
@@ -1427,7 +1603,6 @@ def main():
                             f"[Ensemble {ens+1}] Epoch {epoch}/{config.epochs_attn}  "
                             f"Train Loss: {tr_loss:.4f}  Val Loss: {val_loss:.4f}"
                         )
-
 
                 if val_loss < best_head_val:
                     best_head_val = val_loss
@@ -1457,6 +1632,62 @@ def main():
         val_loader  = DataLoader(val_ds,  batch_size=64, shuffle=False, collate_fn=attn_collate_with_labels)
         test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, collate_fn=attn_collate_with_labels)
         full_loader = DataLoader(full_ds, batch_size=64, shuffle=False, collate_fn=attn_collate_with_labels)
+
+        # ─── Embedding separability check via PCA & t-SNE ───
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+
+        # 1) collect all embeddings & labels
+        X = []
+        Y = []
+        GROUP = []
+        for emb, lbl in full_loader:
+            # emb: (B, T, E), lbl: (B,)
+            # mean‐pool over the token/time dimension
+            m = emb.mean(dim=1)              # (B, E)
+            X.append(m.cpu().numpy())
+            Y.append(lbl.cpu().numpy())
+            # tag train vs test by checking patient ID list lengths
+            # here we assume full_loader uses all_patients in order
+            # you could instead rebuild two separate loaders for train/test
+            GROUP += ['all'] * m.size(0)
+
+        X = np.vstack(X)                    # (N_all, E)
+        Y = np.concatenate(Y)               # (N_all,)
+        GROUP = np.array(GROUP)
+
+        # 2) PCA to 2D
+        pca = PCA(n_components=2)
+        Zp = pca.fit_transform(X)
+        plt.figure(figsize=(6,6))
+        sc = plt.scatter(
+            Zp[:,0], Zp[:,1],
+            c=Y, cmap='coolwarm', alpha=0.7
+        )
+        plt.title("PCA of all patient embeddings")
+        plt.xlabel("PC1"); plt.ylabel("PC2")
+        plt.colorbar(sc, label="label")        # pass the PathCollection here
+        plt.savefig("pca_embeddings.png", dpi=300, bbox_inches="tight")
+        plt.close()
+
+
+        # 3) t-SNE to 2D
+        tsne = TSNE(n_components=2, perplexity=10, random_state=42)
+        Zt = tsne.fit_transform(X)
+        plt.figure(figsize=(6,6))
+        sc2 = plt.scatter(
+            Zt[:,0], Zt[:,1],
+            c=Y, cmap='coolwarm', alpha=0.7
+        )
+        plt.title("t-SNE of all patient embeddings")
+        plt.xlabel("Dim 1"); plt.ylabel("Dim 2")
+        plt.colorbar(sc2, label="label")
+        plt.savefig("tsne_embeddings.png", dpi=300, bbox_inches="tight")
+        plt.close()
+
+
 
         # threshold selection on validation
         val_probs, val_labels = [], []
