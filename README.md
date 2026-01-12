@@ -13,8 +13,6 @@ Google Drive: https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsys
 Run the main script and provide the input paths.  
 The `main.py` will automatically load the data, split edges into 16 patients for training, 3 patients for validation and 4 patient for testing, train the model, and then run final evaluation on the test split.
 
-If you run out of memory, you can adjust dimension from 128 to 64. But please keep in mind, the result may not be as good.
-
 ```bash
 python main.py \
   --data_path /path/to/Data1
