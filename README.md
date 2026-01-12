@@ -1,5 +1,25 @@
 # ADFormer
-A multi-modal transformer model for studying Alzheimer's disease
+
+![Demo image](images/modelarchitecture.pdf)
+
+a two-stage multimodal transformer framework that inte-
+grates volumetric magnetic resonance imaging (MRI) with
+diverse non-imaging biomarkers to enable unified repre-
+sentation learning for Alzheimer’s disease analysis. In the
+first stage, modality-specific encoders are pretrained using
+contrastive learning to align heterogeneous data sources in
+a shared latent space. Three-dimensional MRI volumes are
+encoded using a CLIP-based vision encoder, while hetero-
+geneous non-imaging modalities—including microstruc-
+tural features, biomarker panels, and numeric clinical vari-
+ables—are encoded using multilayer perceptron–based en-
+coders. A contrastive objective encourages consistent rep-
+resentations across modalities while preserving subject-
+level correspondence between imaging and non-imaging
+data. In the second stage, the pretrained embeddings are
+used as inputs to a multimodal transformer that integrates
+information across modalities to produce subject-level pre-
+dictions. 
 
 ---
 ## 📦 Download Required Supporting Files
