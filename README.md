@@ -1,6 +1,6 @@
 # ADFormer
 
-![Demo image](images/modelarchitecture.pdf)
+![Demo image](images/modelarchitecture.jpg)
 
 a two-stage multimodal transformer framework that inte-
 grates volumetric magnetic resonance imaging (MRI) with
