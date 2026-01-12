@@ -11,6 +11,7 @@ Google Drive: https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsys
 ## 🚀 How to Run
 
 Run the main script and provide the input paths.  
+
 The `main.py` will automatically load the data, split edges into 16 patients for training, 3 patients for validation and 4 patient for testing, train the model, and then run final evaluation on the test split.
 
 ```bash
