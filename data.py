@@ -79,21 +79,12 @@ def load_data(base_path):
     e = f(os.path.join(base_path, 'Other.csv'), 'Other', drop=True)
     g = f(os.path.join(base_path, 'Brain_CBF_Imaging.csv'), 'Brain_CBF_Imaging')
 
-    xs = [x for x in (a, b, c, d, e, g) if not x.empty]
-
-    z = (
-        pd.concat([x[['Patient_ID', 'Timepoint']] for x in xs], ignore_index=True)
-        .drop_duplicates()
-        if xs else pd.DataFrame(columns=['Patient_ID', 'Timepoint'])
-    )
-
-    for x in (a, b, c, d, e, g):
-        if not x.empty:
-            z = z.merge(x, on=['Patient_ID', 'Timepoint'], how='outer')
-
-    z.fillna(0, inplace=True)
+    xs = [x for x in (a,b,c,d,e,g) if not x.empty]
+    z = pd.concat([x[['Patient_ID','Timepoint']] for x in xs], ignore_index=True).drop_duplicates() if xs else pd.DataFrame(columns=['Patient_ID','Timepoint'])
+    for x in (a,b,c,d,e,g):
+        if not x.empty: z = z.merge(x,on=['Patient_ID','Timepoint'],how='outer')
+    z.fillna(0,inplace=True)
     return z
-
 
 def load_mri_data(
     root_dir,
