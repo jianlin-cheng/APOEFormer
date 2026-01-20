@@ -28,16 +28,23 @@ Google Drive: https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsys
 
 ---
 
-## 🚀 How to Run
+## 🚀 Train From Scratch (main.py)
 
-Run the main script and provide the input paths.  
-
-The `main.py` will automatically load the data, split edges into 16 patients for training, 3 patients for validation and 4 patient for testing, train the model, and then run final evaluation on the test split.
+`main.py` loads data, performs the train/val/test split, trains the model, and runs final evaluation.
 
 ```bash
 python main.py \
   --data_path /path/to/Data1
 ```
 ---
+⚡ Inference Only (pretrained weights)
 
+Use this when you already have trained checkpoints and just want predictions/evaluation.
+
+```bash
+python inference.py 
+
+```
+
+---
 
