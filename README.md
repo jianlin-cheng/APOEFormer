@@ -2,7 +2,7 @@
 
 ![Demo image](images/modelarchitecture.jpg)
 
-a two-stage multimodal transformer framework that inte-
+A two-stage multimodal transformer framework that inte-
 grates volumetric magnetic resonance imaging (MRI) with
 diverse non-imaging biomarkers to enable unified repre-
 sentation learning for Alzheimer’s disease analysis. In the
