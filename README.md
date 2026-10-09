@@ -21,13 +21,6 @@ used as inputs to a multimodal transformer that integrates
 information across modalities to produce subject-level pre-
 dictions. 
 
----
-## 📦 Download Required Supporting Files
-
-Google Drive: https://mailmissouri-my.sharepoint.com/:f:/g/personal/tmnthc_umsystem_edu/IgA346DkGmR3R6Qzo8JCEv3dAcMy6JaUTNGZIyT_8reWSks?e=dfun40
-
----
-
 ## 🚀 Train From Scratch (main.py)
 
 `main.py` loads data, performs the train/val/test split, trains the model, and runs final evaluation.
